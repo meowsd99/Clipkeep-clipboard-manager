@@ -1,12 +1,15 @@
-# ClipKeep 2.1 (based on ClipKeep 2.0) - added system/light/dark theme support
+# ClipKeep 2.251208 - Enhanced Version with Smooth Animation & Thread Safety
 import sys
 import sqlite3
 import json
 import traceback
+import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 import os
+import hashlib
+import shutil
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -18,15 +21,17 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import (
     QIcon, QAction, QPixmap, QImage, QKeySequence,
-    QShortcut, QWheelEvent, QDesktopServices, QPalette, QColor
+    QShortcut, QWheelEvent, QDesktopServices, QPalette, QColor, QCursor
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QByteArray, QBuffer, QSize, QUrl,
-    QThreadPool, QRunnable, QObject, pyqtSignal, pyqtSlot
+    QThreadPool, QRunnable, QObject, pyqtSignal, pyqtSlot,
+    QPoint, QRect, QPropertyAnimation, QEasingCurve, QMimeData
 )
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 def resource_path(relative_path):
-    """PyInstaller 安全加载资源文件（icons/images）"""
+    """PyInstaller safe resource loading"""
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
@@ -35,20 +40,154 @@ def resource_path(relative_path):
 # Constants
 # -----------------------
 APP_NAME = "ClipKeep"
-APP_VERSION = "2.1"
+APP_VERSION = "2.251208"
+SINGLE_INSTANCE_KEY = "ClipKeep_Single_Instance_Server"
 
 ROLE_TYPE = Qt.ItemDataRole.UserRole
 ROLE_RECORD_ID = Qt.ItemDataRole.UserRole + 1
 ROLE_TIMESTAMP = Qt.ItemDataRole.UserRole + 2
 ROLE_FORMAT = Qt.ItemDataRole.UserRole + 3
+ROLE_CONTENT_HASH = Qt.ItemDataRole.UserRole + 4
 
-MAX_IMAGE_AREA_PIXELS = 4 * 1024 * 1024  # 4MP (Default limit)
+MAX_IMAGE_AREA_PIXELS = 4 * 1024 * 1024
 SAVE_DEBOUNCE_MS = 700
 RESIZE_DEBOUNCE_MS = 150
 DEFAULT_MAX_HISTORY = 100
 THUMBNAIL_SIZE = 64
 
-# WinUI 3.0 Inspired Stylesheet (light)
+# Edge hide settings
+EDGE_HIDE_THRESHOLD = 5
+EDGE_SHOW_WIDTH = 3
+EDGE_DETECT_AREA = 30  # 增加检测区域
+ANIMATION_DURATION = 250
+EDGE_HIDE_DELAY_MS = 1500  # 贴边后等待1.5秒再隐藏
+EDGE_SHOW_DELAY_MS = 300   # 光标靠近后等待0.3秒再显示
+
+# Temp cleanup settings
+TEMP_CLEANUP_DAYS = 1
+MIN_FREE_SPACE_MB = 50
+
+# -----------------------
+# Multi-Language Support
+# -----------------------
+TRANSLATIONS = {
+    "zh_CN": {
+        "window_title": "ClipKeep",
+        "items": "历史",
+        "settings": "设置",
+        "clear": "清空",
+        "search_placeholder": "🔍 搜索剪切板... (Ctrl+F)",
+        "content_preview": "内容预览...",
+        "zoom_hint": "💡 Ctrl+Scroll 缩放 | Ctrl+0 重置",
+        "ready": "Ready",
+        "settings_title": "设置",
+        "always_on_top": "窗口置顶 (Always on Top)",
+        "theme": "主题 (Theme):",
+        "theme_system": "跟随系统 (默认)",
+        "theme_light": "亮色模式 (Light)",
+        "theme_dark": "暗色模式 (Dark)",
+        "language": "语言 (Language):",
+        "language_zh": "简体中文",
+        "language_en": "English",
+        "max_history": "最大历史记录数:",
+        "advanced_features": "高级功能 & 格式",
+        "save_original": "保存图片原图 (不压缩)",
+        "save_original_tip": "开启后将忽略4MP限制,保存完整图片。可能会占用更多空间。",
+        "enable_rich_text": "支持富文本 (HTML)",
+        "enable_file_paths": "支持文件路径复制",
+        "edge_hide": "贴边自动隐藏",
+        "save": "保存",
+        "cancel": "取消",
+        "settings_saved": "设置已保存",
+        "show_window": "显示主窗口",
+        "exit_app": "退出 ClipKeep",
+        "minimized_to_tray": "应用已最小化到托盘",
+        "confirm_clear": "确认清空",
+        "confirm_clear_msg": "确定要删除所有记录吗?此操作不可恢复。",
+        "history_cleared": "历史已清空",
+        "deleted": "已删除",
+        "copied_text": "✓ 已复制文本",
+        "copied_html": "✓ 已复制富文本",
+        "copied_file": "✓ 已复制文件路径",
+        "copied_image": "✓ 已复制图片",
+        "auto_saved": "已自动保存更改",
+        "rich_text_prefix": "(富文本) ",
+        "file_list": "📂 文件列表",
+        "image": "🖼️ 图片",
+        "context_open": "📂 打开文件",
+        "context_delete": "🗑️ 删除",
+        "open_failed": "打开失败",
+        "file_not_found": "文件不存在或无法访问",
+        "already_running": "程序已在运行",
+        "already_running_msg": "ClipKeep 已经在运行中，请检查系统托盘。",
+        "self_check_failed": "自检失败",
+        "db_check_failed": "数据库检查失败，程序可能无法正常工作",
+        "temp_check_failed": "临时目录不可写或磁盘空间不足",
+        "tray_check_failed": "系统托盘不可用",
+        "self_check_passed": "✓ 自检通过"
+    },
+    "en_US": {
+        "window_title": "ClipKeep",
+        "items": "History",
+        "settings": "Settings",
+        "clear": "Clear",
+        "search_placeholder": "🔍 Search clipboard... (Ctrl+F)",
+        "content_preview": "Content preview...",
+        "zoom_hint": "💡 Ctrl+Scroll to Zoom | Ctrl+0 Reset",
+        "ready": "Ready",
+        "settings_title": "Settings",
+        "always_on_top": "Always on Top",
+        "theme": "Theme:",
+        "theme_system": "Follow System (Default)",
+        "theme_light": "Light Mode",
+        "theme_dark": "Dark Mode",
+        "language": "Language:",
+        "language_zh": "简体中文",
+        "language_en": "English",
+        "max_history": "Max History Records:",
+        "advanced_features": "Advanced Features & Formats",
+        "save_original": "Save Original Images (No Compression)",
+        "save_original_tip": "Will ignore 4MP limit and save full images. May use more storage.",
+        "enable_rich_text": "Enable Rich Text (HTML)",
+        "enable_file_paths": "Enable File Path Copying",
+        "edge_hide": "Auto-hide at Screen Edge",
+        "save": "Save",
+        "cancel": "Cancel",
+        "settings_saved": "Settings Saved",
+        "show_window": "Show Main Window",
+        "exit_app": "Exit ClipKeep",
+        "minimized_to_tray": "Minimized to system tray",
+        "confirm_clear": "Confirm Clear",
+        "confirm_clear_msg": "Are you sure you want to delete all records? This cannot be undone.",
+        "history_cleared": "History Cleared",
+        "deleted": "Deleted",
+        "copied_text": "✓ Text Copied",
+        "copied_html": "✓ Rich Text Copied",
+        "copied_file": "✓ File Path Copied",
+        "copied_image": "✓ Image Copied",
+        "auto_saved": "Changes Auto-saved",
+        "rich_text_prefix": "(HTML) ",
+        "file_list": "📂 File List",
+        "image": "🖼️ Image",
+        "context_open": "📂 Open File",
+        "context_delete": "🗑️ Delete",
+        "open_failed": "Open Failed",
+        "file_not_found": "File not found or inaccessible",
+        "already_running": "Already Running",
+        "already_running_msg": "ClipKeep is already running. Please check the system tray.",
+        "self_check_failed": "Self-check Failed",
+        "db_check_failed": "Database check failed, app may not work properly",
+        "temp_check_failed": "Temp directory not writable or low disk space",
+        "tray_check_failed": "System tray unavailable",
+        "self_check_passed": "✓ Self-check Passed"
+    }
+}
+
+def tr(key: str, lang: str = "zh_CN") -> str:
+    """Translation helper"""
+    return TRANSLATIONS.get(lang, TRANSLATIONS["zh_CN"]).get(key, key)
+
+# WinUI 3.0 Stylesheet
 WINUI_STYLESHEET = """
 QMainWindow {
     background-color: #f3f3f3;
@@ -117,7 +256,6 @@ QLabel#DetailPlaceholder {
 }
 """
 
-# Dark Stylesheet
 DARK_STYLESHEET = """
 QMainWindow {
     background-color: #1f1f1f;
@@ -168,7 +306,7 @@ QListWidget::item {
     color: #e8e8e8;
 }
 QListWidget::item:selected {
-    background-color: #005090; /* adapted WinUI blue for dark */
+    background-color: #005090;
     color: #ffffff;
     border: none;
 }
@@ -197,13 +335,14 @@ class ClipboardRecord:
     """Represents a single clipboard record."""
     def __init__(self, record_id: int, record_type: str, content: any,
                  timestamp: float, thumbnail: Optional[bytes] = None,
-                 fmt: str = "plain"):
+                 fmt: str = "plain", content_hash: str = ""):
         self.id = record_id
         self.type = record_type
         self.content = content
         self.timestamp = timestamp
         self.thumbnail = thumbnail
-        self.format = fmt  # 'plain', 'html', 'file', 'PNG', 'JPEG'
+        self.format = fmt
+        self.content_hash = content_hash
 
 
 class ClipboardDatabase:
@@ -214,92 +353,142 @@ class ClipboardDatabase:
         self._init_database()
 
     def _init_database(self):
-        # Allow check_same_thread=False for read operations from workers,
-        # but writes should be carefully managed (mainly main thread).
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        cursor = self.conn.cursor()
+        try:
+            self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            cursor = self.conn.cursor()
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT NOT NULL,
-                content TEXT,
-                content_blob BLOB,
-                timestamp REAL NOT NULL,
-                thumbnail BLOB,
-                format TEXT,
-                width INTEGER,
-                height INTEGER
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_timestamp ON records(timestamp DESC)
-        """)
-        self.conn.commit()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type TEXT NOT NULL,
+                    content TEXT,
+                    content_blob BLOB,
+                    timestamp REAL NOT NULL,
+                    thumbnail BLOB,
+                    format TEXT,
+                    width INTEGER,
+                    height INTEGER,
+                    content_hash TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_timestamp ON records(timestamp DESC)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_hash ON records(content_hash)
+            """)
+            self.conn.commit()
+        except Exception as e:
+            print(f"Database init error: {e}")
+            raise
+
+    def test_write(self) -> bool:
+        """Test database write capability"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("INSERT INTO records (type, content, timestamp, format) VALUES (?, ?, ?, ?)",
+                          ("text", "_test_", datetime.now().timestamp(), "plain"))
+            test_id = cursor.lastrowid
+            self.conn.commit()
+            cursor.execute("DELETE FROM records WHERE id = ?", (test_id,))
+            self.conn.commit()
+            return True
+        except:
+            return False
 
     def add_text_record(self, text: str, record_format: str = "plain") -> int:
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO records (type, content, timestamp, format)
-            VALUES (?, ?, ?, ?)
-        """, ("text", text, datetime.now().timestamp(), record_format))
-        self.conn.commit()
-        return cursor.lastrowid
+        try:
+            content_hash = hashlib.md5(text.encode()).hexdigest()
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT INTO records (type, content, timestamp, format, content_hash)
+                VALUES (?, ?, ?, ?, ?)
+            """, ("text", text, datetime.now().timestamp(), record_format, content_hash))
+            self.conn.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            print(f"Add text record error: {e}")
+            return 0
 
-    def add_image_record(self, image: QImage, thumbnail: bytes, fmt: str) -> int:
-        byte_array = QByteArray()
-        buffer = QBuffer(byte_array)
-        buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+    def add_image_record(self, image_data: bytes, thumbnail: bytes, fmt: str, 
+                        width: int, height: int, content_hash: str) -> int:
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT INTO records (type, content_blob, timestamp, thumbnail, format, width, height, content_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                "image",
+                image_data,
+                datetime.now().timestamp(),
+                thumbnail,
+                fmt,
+                width,
+                height,
+                content_hash
+            ))
+            self.conn.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            print(f"Add image record error: {e}")
+            return 0
 
-        # Save exact blob
-        quality = -1 if fmt == "PNG" else 90
-        image.save(buffer, fmt, quality)
-        buffer.close()
-
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO records (type, content_blob, timestamp, thumbnail, format, width, height)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            "image",
-            byte_array.data(),
-            datetime.now().timestamp(),
-            thumbnail,
-            fmt,
-            image.width(),
-            image.height()
-        ))
-        self.conn.commit()
-        return cursor.lastrowid
+    def check_duplicate_hash(self, content_hash: str) -> bool:
+        """Check if content hash exists in recent records"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT id FROM records 
+                WHERE content_hash = ? 
+                ORDER BY timestamp DESC LIMIT 1
+            """, (content_hash,))
+            return cursor.fetchone() is not None
+        except:
+            return False
 
     def update_text_content(self, record_id: int, new_text: str):
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE records SET content = ? WHERE id = ?", (new_text, record_id))
-        self.conn.commit()
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE records SET content = ? WHERE id = ?", (new_text, record_id))
+            self.conn.commit()
+        except Exception as e:
+            print(f"Update text error: {e}")
 
     def delete_record(self, record_id: int):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM records WHERE id = ?", (record_id,))
-        self.conn.commit()
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM records WHERE id = ?", (record_id,))
+            self.conn.commit()
+        except Exception as e:
+            print(f"Delete record error: {e}")
 
     def clear_all(self):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM records")
-        self.conn.commit()
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM records")
+            self.conn.commit()
+        except Exception as e:
+            print(f"Clear all error: {e}")
 
     def get_count(self) -> int:
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM records")
-        return cursor.fetchone()[0]
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM records")
+            return cursor.fetchone()[0]
+        except:
+            return 0
 
     def trim_to_limit(self, max_count: int):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            DELETE FROM records WHERE id NOT IN (
-                SELECT id FROM records ORDER BY timestamp DESC LIMIT ?
-            )
-        """, (max_count,))
-        self.conn.commit()
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                DELETE FROM records WHERE id NOT IN (
+                    SELECT id FROM records ORDER BY timestamp DESC LIMIT ?
+                )
+            """, (max_count,))
+            self.conn.commit()
+        except Exception as e:
+            print(f"Trim error: {e}")
 
     def close(self):
         if self.conn:
@@ -314,7 +503,7 @@ class WorkerSignals(QObject):
     result = pyqtSignal(object)
 
 class DBWorker(QRunnable):
-    """Generic worker for database operations to avoid blocking UI."""
+    """Generic worker for database operations"""
     def __init__(self, db_path: Path, mode: str, **kwargs):
         super().__init__()
         self.db_path = db_path
@@ -325,7 +514,6 @@ class DBWorker(QRunnable):
     @pyqtSlot()
     def run(self):
         try:
-            # Create a fresh connection for thread safety
             conn = sqlite3.connect(str(self.db_path))
             cursor = conn.cursor()
             output = None
@@ -333,42 +521,235 @@ class DBWorker(QRunnable):
             if self.mode == "load_all":
                 limit = self.kwargs.get("limit", 100)
                 cursor.execute("""
-                    SELECT id, type, content, content_blob, timestamp, thumbnail, format
+                    SELECT id, type, content, content_blob, timestamp, thumbnail, format, content_hash
                     FROM records ORDER BY timestamp DESC LIMIT ?
                 """, (limit,))
                 rows = cursor.fetchall()
                 records = []
                 for row in rows:
-                    rec_id, rec_type, txt, blob, ts, thumb, fmt = row
-                    # For list view, we don't load full image blobs, only thumbs/text
+                    rec_id, rec_type, txt, blob, ts, thumb, fmt, c_hash = row
                     content = txt if rec_type == "text" else None
-                    records.append(ClipboardRecord(rec_id, rec_type, content, ts, thumb, fmt))
+                    records.append(ClipboardRecord(rec_id, rec_type, content, ts, thumb, fmt, c_hash or ""))
                 output = records
 
             elif self.mode == "get_detail":
                 rec_id = self.kwargs.get("record_id")
                 cursor.execute("""
-                    SELECT id, type, content, content_blob, timestamp, thumbnail, format
+                    SELECT id, type, content, content_blob, timestamp, thumbnail, format, content_hash
                     FROM records WHERE id = ?
                 """, (rec_id,))
                 row = cursor.fetchone()
                 if row:
-                    rec_id, rec_type, txt, blob, ts, thumb, fmt = row
+                    rec_id, rec_type, txt, blob, ts, thumb, fmt, c_hash = row
                     if rec_type == "text":
                         content = txt
                     else:
                         image = QImage()
                         image.loadFromData(blob)
                         content = image
-                    output = ClipboardRecord(rec_id, rec_type, content, ts, thumb, fmt)
+                    output = ClipboardRecord(rec_id, rec_type, content, ts, thumb, fmt, c_hash or "")
 
             conn.close()
             self.signals.result.emit(output)
-        except Exception:
+        except Exception as e:
+            print(f"DBWorker error: {e}")
             traceback.print_exc()
             self.signals.error.emit(sys.exc_info())
         finally:
             self.signals.finished.emit()
+
+class ImageProcessWorker(QRunnable):
+    """Worker for processing and saving images"""
+    def __init__(self, image: QImage, db_path: Path, max_area: int, save_original: bool):
+        super().__init__()
+        self.image = image
+        self.db_path = db_path
+        self.max_area = max_area
+        self.save_original = save_original
+        self.signals = WorkerSignals()
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            persist_image = self.image
+            
+            # Resize if needed
+            if not self.save_original:
+                area = self.image.width() * self.image.height()
+                if area > self.max_area:
+                    scale_factor = (self.max_area / area) ** 0.5
+                    new_width = int(self.image.width() * scale_factor)
+                    new_height = int(self.image.height() * scale_factor)
+                    persist_image = self.image.scaled(
+                        new_width, new_height,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+
+            # Generate thumbnail
+            thumb = persist_image.scaled(
+                THUMBNAIL_SIZE, THUMBNAIL_SIZE,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            
+            thumb_array = QByteArray()
+            thumb_buffer = QBuffer(thumb_array)
+            thumb_buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+            thumb.save(thumb_buffer, "PNG")
+            thumb_buffer.close()
+
+            # Save full image
+            has_alpha = persist_image.hasAlphaChannel()
+            fmt = "PNG" if has_alpha else "JPEG"
+            
+            img_array = QByteArray()
+            img_buffer = QBuffer(img_array)
+            img_buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+            quality = -1 if fmt == "PNG" else 90
+            persist_image.save(img_buffer, fmt, quality)
+            img_buffer.close()
+
+            # Calculate hash
+            content_hash = hashlib.md5(img_array.data()).hexdigest()
+
+            # Save to database
+            conn = sqlite3.connect(str(self.db_path))
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO records (type, content_blob, timestamp, thumbnail, format, width, height, content_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                "image",
+                img_array.data(),
+                datetime.now().timestamp(),
+                thumb_array.data(),
+                fmt,
+                persist_image.width(),
+                persist_image.height(),
+                content_hash
+            ))
+            conn.commit()
+            record_id = cursor.lastrowid
+            conn.close()
+
+            # Clean up
+            del persist_image
+            del thumb
+            del img_array
+            del thumb_array
+            
+            self.signals.result.emit(content_hash)
+        except Exception as e:
+            print(f"Image process error: {e}")
+            traceback.print_exc()
+            self.signals.error.emit(sys.exc_info())
+        finally:
+            self.signals.finished.emit()
+
+class SelfCheckWorker(QRunnable):
+    """Worker for self-check on startup"""
+    def __init__(self, db_path: Path, temp_dir: Path):
+        super().__init__()
+        self.db_path = db_path
+        self.temp_dir = temp_dir
+        self.signals = WorkerSignals()
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            result = {
+                "db_ok": False,
+                "temp_ok": False,
+                "space_ok": False,
+                "tray_ok": False
+            }
+
+            # Check database
+            try:
+                conn = sqlite3.connect(str(self.db_path))
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO records (type, content, timestamp, format) VALUES (?, ?, ?, ?)",
+                              ("text", "_test_", datetime.now().timestamp(), "plain"))
+                test_id = cursor.lastrowid
+                conn.commit()
+                cursor.execute("DELETE FROM records WHERE id = ?", (test_id,))
+                conn.commit()
+                conn.close()
+                result["db_ok"] = True
+            except:
+                pass
+
+            # Check temp directory
+            try:
+                test_file = self.temp_dir / "_test_write"
+                test_file.write_text("test")
+                test_file.unlink()
+                result["temp_ok"] = True
+            except:
+                pass
+
+            # Check disk space
+            try:
+                stat = shutil.disk_usage(self.temp_dir)
+                free_mb = stat.free / (1024 * 1024)
+                result["space_ok"] = free_mb > MIN_FREE_SPACE_MB
+            except:
+                pass
+
+            # Check system tray
+            result["tray_ok"] = QSystemTrayIcon.isSystemTrayAvailable()
+
+            self.signals.result.emit(result)
+        except Exception as e:
+            print(f"Self-check error: {e}")
+            self.signals.error.emit(sys.exc_info())
+        finally:
+            self.signals.finished.emit()
+
+# -----------------------
+# Temp File Manager
+# -----------------------
+class TempFileManager:
+    """Manage temporary files with auto-cleanup"""
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir
+        self.session_dir = None
+        self.init_session()
+
+    def init_session(self):
+        """Create session directory"""
+        try:
+            self.base_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            pid = os.getpid()
+            self.session_dir = self.base_dir / f"session_{timestamp}_{pid}"
+            self.session_dir.mkdir(exist_ok=True)
+        except Exception as e:
+            print(f"Init session error: {e}")
+
+    def cleanup_old_files(self):
+        """Remove old temp files"""
+        try:
+            if not self.base_dir.exists():
+                return
+            
+            cutoff_time = datetime.now() - timedelta(days=TEMP_CLEANUP_DAYS)
+            
+            for item in self.base_dir.iterdir():
+                if item.is_dir() and item.name.startswith("session_"):
+                    # Check modification time
+                    mtime = datetime.fromtimestamp(item.stat().st_mtime)
+                    if mtime < cutoff_time:
+                        shutil.rmtree(item, ignore_errors=True)
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+
+    def get_temp_file(self, record_id: int, fmt: str) -> Path:
+        """Get temp file path for a record"""
+        if not self.session_dir:
+            self.init_session()
+        return self.session_dir / f"image_{record_id}.{fmt.lower()}"
 
 # -----------------------
 # Custom Widgets
@@ -443,27 +824,27 @@ class ZoomableImageLabel(QLabel):
             self._update_display()
 
 class SettingsDialog(QDialog):
-    """Settings Window using QDialog."""
-    def __init__(self, settings: dict, parent=None):
+    """Settings Dialog"""
+    def __init__(self, settings: dict, current_lang: str, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.setWindowTitle("设置")
-        self.setFixedWidth(380)
+        self.current_lang = current_lang
+        self.setWindowTitle(tr("settings_title", current_lang))
+        self.setFixedWidth(400)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
         # General
-        self.check_top = QCheckBox("窗口置顶 (Always on Top)")
+        self.check_top = QCheckBox(tr("always_on_top", current_lang))
         self.check_top.setChecked(settings.get("window_always_on_top", False))
         form.addRow(self.check_top)
 
-        # Theme selection
+        # Theme
         self.combo_theme = QComboBox()
-        # Display labels: follow system / light / dark
-        self.combo_theme.addItem("跟随系统 (默认)", "system")
-        self.combo_theme.addItem("亮色模式 (Light)", "light")
-        self.combo_theme.addItem("暗色模式 (Dark)", "dark")
+        self.combo_theme.addItem(tr("theme_system", current_lang), "system")
+        self.combo_theme.addItem(tr("theme_light", current_lang), "light")
+        self.combo_theme.addItem(tr("theme_dark", current_lang), "dark")
         current_theme = settings.get("app_theme", "system")
         idx = 0
         for i in range(self.combo_theme.count()):
@@ -471,44 +852,56 @@ class SettingsDialog(QDialog):
                 idx = i
                 break
         self.combo_theme.setCurrentIndex(idx)
-        form.addRow("主题 (Theme):", self.combo_theme)
+        form.addRow(tr("theme", current_lang), self.combo_theme)
+
+        # Language
+        self.combo_lang = QComboBox()
+        self.combo_lang.addItem(tr("language_zh", current_lang), "zh_CN")
+        self.combo_lang.addItem(tr("language_en", current_lang), "en_US")
+        lang_idx = 0 if current_lang == "zh_CN" else 1
+        self.combo_lang.setCurrentIndex(lang_idx)
+        form.addRow(tr("language", current_lang), self.combo_lang)
 
         # History Limit
         self.spin_history = QSpinBox()
         self.spin_history.setRange(10, 1000)
         self.spin_history.setSingleStep(10)
         self.spin_history.setValue(settings.get("max_history", DEFAULT_MAX_HISTORY))
-        form.addRow("最大历史记录数:", self.spin_history)
+        form.addRow(tr("max_history", current_lang), self.spin_history)
 
         layout.addLayout(form)
 
-        # Formats Group
-        grp_formats = QGroupBox("高级功能 & 格式")
+        # Advanced
+        grp_formats = QGroupBox(tr("advanced_features", current_lang))
         fmt_layout = QVBoxLayout()
 
-        self.check_save_orig = QCheckBox("保存图片原图 (不压缩)")
-        self.check_save_orig.setToolTip("开启后将忽略4MP限制，保存完整图片。可能会占用更多空间。")
+        self.check_save_orig = QCheckBox(tr("save_original", current_lang))
+        self.check_save_orig.setToolTip(tr("save_original_tip", current_lang))
         self.check_save_orig.setChecked(settings.get("save_original_image", False))
         fmt_layout.addWidget(self.check_save_orig)
 
-        self.check_rich_text = QCheckBox("支持富文本 (HTML)")
+        self.check_rich_text = QCheckBox(tr("enable_rich_text", current_lang))
         self.check_rich_text.setChecked(settings.get("enable_rich_text", True))
         fmt_layout.addWidget(self.check_rich_text)
 
-        self.check_files = QCheckBox("支持文件路径复制")
+        self.check_files = QCheckBox(tr("enable_file_paths", current_lang))
         self.check_files.setChecked(settings.get("enable_file_paths", True))
         fmt_layout.addWidget(self.check_files)
+
+        self.check_edge_hide = QCheckBox(tr("edge_hide", current_lang))
+        self.check_edge_hide.setChecked(settings.get("edge_hide_enabled", False))
+        fmt_layout.addWidget(self.check_edge_hide)
 
         grp_formats.setLayout(fmt_layout)
         layout.addWidget(grp_formats)
 
         # Buttons
         btn_layout = QHBoxLayout()
-        btn_save = QPushButton("保存")
+        btn_save = QPushButton(tr("save", current_lang))
         btn_save.clicked.connect(self.accept)
         btn_save.setStyleSheet("background-color: #0078D4; color: white; border: none;")
 
-        btn_cancel = QPushButton("取消")
+        btn_cancel = QPushButton(tr("cancel", current_lang))
         btn_cancel.clicked.connect(self.reject)
 
         btn_layout.addStretch()
@@ -523,14 +916,15 @@ class SettingsDialog(QDialog):
             "save_original_image": self.check_save_orig.isChecked(),
             "enable_rich_text": self.check_rich_text.isChecked(),
             "enable_file_paths": self.check_files.isChecked(),
-            "app_theme": self.combo_theme.currentData() or "system"
+            "app_theme": self.combo_theme.currentData() or "system",
+            "language": self.combo_lang.currentData() or "zh_CN",
+            "edge_hide_enabled": self.check_edge_hide.isChecked()
         }
 
 # -----------------------
 # Main Application
 # -----------------------
-
-class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definition
+class ClipKeepApp(QMainWindow):
     def __init__(self):
         super().__init__()
         
@@ -541,18 +935,25 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
             pass
 
         # Core Setup
-        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+        self.current_lang = "zh_CN"
+        self.setWindowTitle(f"{tr('window_title', self.current_lang)} {APP_VERSION}")
         self.resize(550, 700)
         self.setMinimumSize(400, 500)
 
         # Configuration
-        self.config_dir = Path.home() / ".holder"
+        self.config_dir = Path.home() / ".clipkeep"
         self.config_dir.mkdir(exist_ok=True)
         self.db_path = self.config_dir / "clipboard.db"
         self.settings_file = self.config_dir / "settings.json"
+        self.temp_dir = self.config_dir / "temp"
 
         self.settings = self.load_settings()
+        self.current_lang = self.settings.get("language", "zh_CN")
         self.max_history = self.settings.get("max_history", DEFAULT_MAX_HISTORY)
+
+        # Temp file manager
+        self.temp_manager = TempFileManager(self.temp_dir)
+        self.temp_manager.cleanup_old_files()
 
         # Database & Threading
         self.db = ClipboardDatabase(self.db_path)
@@ -560,8 +961,28 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
 
         # State
         self.is_internal_copy = False
-        self.force_quit = False  # Controlled exit vs minimize
+        self.force_quit = False
         self.current_record: Optional[ClipboardRecord] = None
+        self.last_clipboard_hash = ""
+
+        # Edge Hide State
+        self.is_hidden = False
+        self.original_geometry = None
+        self.hide_animation = None
+        self.at_edge_time = None  # 记录到达边缘的时间
+        self.hide_pending = False  # 是否有待执行的隐藏
+        self.show_pending = False  # 是否有待执行的显示
+        
+        self.edge_hide_timer = QTimer()
+        self.edge_hide_timer.timeout.connect(self.check_edge_hide)
+        
+        self.edge_hide_delay_timer = QTimer()
+        self.edge_hide_delay_timer.setSingleShot(True)
+        self.edge_hide_delay_timer.timeout.connect(self.execute_hide)
+        
+        self.edge_show_delay_timer = QTimer()
+        self.edge_show_delay_timer.setSingleShot(True)
+        self.edge_show_delay_timer.timeout.connect(self.execute_show)
 
         # Timers
         self._save_timer = QTimer()
@@ -570,24 +991,211 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
         self._pending_save_id = None
         self._pending_save_text = None
 
-        self._resize_timer = QTimer()
-        self._resize_timer.setSingleShot(True)
-        self._resize_timer.timeout.connect(self._on_resize_complete)
-
         # UI Initialization
-        # Default: apply theme-aware stylesheet through apply_settings
         self.init_ui()
         self.setup_tray()
         self.setup_shortcuts()
         self.apply_settings()
-        self.refresh_history_async()
 
-        # Clipboard Monitor
+        # Run self-check
+        self.run_self_check()
+
+        # Start monitoring
         self.clipboard = QApplication.clipboard()
         self.clipboard.dataChanged.connect(self.on_clipboard_change)
 
     # -----------------------
-    # Theme & Settings Management
+    # Self-Check
+    # -----------------------
+    def run_self_check(self):
+        """Run startup self-check"""
+        worker = SelfCheckWorker(self.db_path, self.temp_dir)
+        worker.signals.result.connect(self.on_self_check_complete)
+        self.threadpool.start(worker)
+
+    def on_self_check_complete(self, result: dict):
+        """Handle self-check results"""
+        errors = []
+        
+        if not result.get("db_ok"):
+            errors.append(tr("db_check_failed", self.current_lang))
+        
+        if not result.get("temp_ok") or not result.get("space_ok"):
+            errors.append(tr("temp_check_failed", self.current_lang))
+        
+        if not result.get("tray_ok"):
+            errors.append(tr("tray_check_failed", self.current_lang))
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                tr("self_check_failed", self.current_lang),
+                "\n".join(errors)
+            )
+        else:
+            self.statusBar().showMessage(tr("self_check_passed", self.current_lang), 3000)
+            self.refresh_history_async()
+
+    # -----------------------
+    # Single Instance
+    # -----------------------
+    @staticmethod
+    def create_single_instance_server() -> Optional[QLocalServer]:
+        """Create server for single instance"""
+        # Try to connect first
+        socket = QLocalSocket()
+        socket.connectToServer(SINGLE_INSTANCE_KEY)
+        if socket.waitForConnected(500):
+            socket.close()
+            return None  # Already running
+
+        # Create server
+        server = QLocalServer()
+        QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+        if not server.listen(SINGLE_INSTANCE_KEY):
+            return None
+        return server
+
+    # -----------------------
+    # Edge Hide with Animation
+    # -----------------------
+    def check_edge_hide(self):
+        """Check if window should hide/show at screen edge"""
+        if not self.settings.get("edge_hide_enabled", False):
+            return
+        
+        if not self.isVisible() or self.isMinimized():
+            return
+
+        # 如果正在播放动画，不做任何检查
+        if self.hide_animation and self.hide_animation.state() == QPropertyAnimation.State.Running:
+            return
+
+        screen = QApplication.primaryScreen().geometry()
+        win_geo = self.geometry()
+        cursor_pos = QCursor.pos()
+
+        # 检查窗口是否在边缘
+        at_left_edge = win_geo.x() <= EDGE_HIDE_THRESHOLD
+        at_right_edge = win_geo.x() + win_geo.width() >= screen.width() - EDGE_HIDE_THRESHOLD
+        at_top_edge = win_geo.y() <= EDGE_HIDE_THRESHOLD
+        at_edge = at_left_edge or at_right_edge or at_top_edge
+
+        if not self.is_hidden:
+            # 窗口未隐藏状态
+            if at_edge:
+                # 窗口在边缘
+                cursor_in_window = win_geo.contains(cursor_pos)
+                
+                if cursor_in_window:
+                    # 光标在窗口内，取消任何待执行的隐藏
+                    self.at_edge_time = None
+                    self.hide_pending = False
+                    self.edge_hide_delay_timer.stop()
+                else:
+                    # 光标不在窗口内，开始计时准备隐藏
+                    if not self.hide_pending:
+                        self.hide_pending = True
+                        self.edge_hide_delay_timer.start(EDGE_HIDE_DELAY_MS)
+            else:
+                # 窗口不在边缘，取消隐藏
+                self.at_edge_time = None
+                self.hide_pending = False
+                self.edge_hide_delay_timer.stop()
+        else:
+            # 窗口已隐藏状态
+            # 检查光标是否靠近隐藏区域
+            cursor_near = False
+            
+            if at_left_edge and cursor_pos.x() <= EDGE_DETECT_AREA:
+                cursor_near = True
+            elif at_right_edge and cursor_pos.x() >= screen.width() - EDGE_DETECT_AREA:
+                cursor_near = True
+            elif at_top_edge and cursor_pos.y() <= EDGE_DETECT_AREA:
+                cursor_near = True
+            
+            if cursor_near:
+                # 光标靠近，准备显示
+                if not self.show_pending:
+                    self.show_pending = True
+                    self.edge_show_delay_timer.start(EDGE_SHOW_DELAY_MS)
+            else:
+                # 光标远离，取消显示
+                self.show_pending = False
+                self.edge_show_delay_timer.stop()
+
+    def execute_hide(self):
+        """执行隐藏动画"""
+        self.hide_pending = False
+        
+        # 再次检查光标位置，确保光标确实不在窗口内
+        cursor_pos = QCursor.pos()
+        if self.geometry().contains(cursor_pos):
+            return  # 光标回到窗口内，取消隐藏
+        
+        self.hide_to_edge_animated()
+
+    def execute_show(self):
+        """执行显示动画"""
+        self.show_pending = False
+        self.show_from_edge_animated()
+
+    def hide_to_edge_animated(self):
+        """Hide window to edge with smooth animation"""
+        if self.is_hidden or self.hide_animation:
+            return
+
+        self.original_geometry = self.geometry()
+        screen = QApplication.primaryScreen().geometry()
+        geo = self.geometry()
+
+        target_geo = QRect(geo)
+        
+        if geo.x() <= EDGE_HIDE_THRESHOLD:
+            target_geo.moveLeft(-geo.width() + EDGE_SHOW_WIDTH)
+        elif geo.x() + geo.width() >= screen.width() - EDGE_HIDE_THRESHOLD:
+            target_geo.moveLeft(screen.width() - EDGE_SHOW_WIDTH)
+        elif geo.y() <= EDGE_HIDE_THRESHOLD:
+            target_geo.moveTop(-geo.height() + EDGE_SHOW_WIDTH)
+
+        self.hide_animation = QPropertyAnimation(self, b"geometry")
+        self.hide_animation.setDuration(ANIMATION_DURATION)
+        self.hide_animation.setStartValue(geo)
+        self.hide_animation.setEndValue(target_geo)
+        self.hide_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.hide_animation.finished.connect(self.on_hide_finished)
+        self.hide_animation.start()
+
+    def on_hide_finished(self):
+        """Called when hide animation finishes"""
+        self.is_hidden = True
+        self.hide_animation = None
+
+    def show_from_edge_animated(self):
+        """Show window from edge with smooth animation"""
+        if not self.is_hidden or not self.original_geometry or self.hide_animation:
+            return
+
+        current_geo = self.geometry()
+        
+        self.hide_animation = QPropertyAnimation(self, b"geometry")
+        self.hide_animation.setDuration(ANIMATION_DURATION)
+        self.hide_animation.setStartValue(current_geo)
+        self.hide_animation.setEndValue(self.original_geometry)
+        self.hide_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.hide_animation.finished.connect(self.on_show_finished)
+        self.hide_animation.start()
+
+    def on_show_finished(self):
+        """Called when show animation finishes"""
+        self.is_hidden = False
+        self.hide_animation = None
+        # 显示完成后，重置状态，允许再次隐藏
+        self.at_edge_time = None
+        self.hide_pending = False
+
+    # -----------------------
+    # Settings Management
     # -----------------------
     def load_settings(self) -> dict:
         defaults = {
@@ -596,7 +1204,9 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
             "save_original_image": False,
             "enable_rich_text": True,
             "enable_file_paths": True,
-            "app_theme": "system"  # 'system' | 'light' | 'dark'
+            "app_theme": "system",
+            "language": "zh_CN",
+            "edge_hide_enabled": False
         }
         if self.settings_file.exists():
             try:
@@ -615,78 +1225,91 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
             print(f"Error saving settings: {e}")
 
     def is_system_dark(self) -> bool:
-        """
-        Heuristic to detect system preference for dark mode using QApplication palette.
-        Returns True if the system palette suggests dark theme.
-        """
+        """Detect system dark mode"""
         try:
             pal = QApplication.palette()
-            # Get window background color
             bg = pal.color(QPalette.ColorRole.Window)
-            # Compute perceived luminance
             r, g, b = bg.red(), bg.green(), bg.blue()
-            # Relative luminance approximation
             luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
             return luminance < 128
-        except Exception:
+        except:
             return False
 
     def get_current_stylesheet(self, theme: str) -> str:
-        """
-        Return the appropriate stylesheet string based on setting:
-         - 'system' -> detect via is_system_dark()
-         - 'light' or 'dark' -> force
-        """
+        """Return stylesheet based on theme"""
         if theme == "light":
             return WINUI_STYLESHEET
         elif theme == "dark":
             return DARK_STYLESHEET
         else:
-            # system
             return DARK_STYLESHEET if self.is_system_dark() else WINUI_STYLESHEET
 
     def apply_settings(self):
-        # Window on top
+        # Window flags
         if self.settings.get("window_always_on_top", False):
-            self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+            self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         else:
-            self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowStaysOnTopHint)
+            self.setWindowFlags((self.windowFlags() & ~Qt.WindowType.WindowStaysOnTopHint) | Qt.WindowType.Tool)
+        
         self.max_history = self.settings.get("max_history", DEFAULT_MAX_HISTORY)
 
-        # Apply theme stylesheet
+        # Apply theme
         theme = self.settings.get("app_theme", "system")
         stylesheet = self.get_current_stylesheet(theme)
-        # Apply to the main window (affects children)
         self.setStyleSheet(stylesheet)
 
-        # Additional per-widget tweaks that cannot be fully controlled via global stylesheet:
-        # ZoomableImageLabel background / border adjustments:
+        # Widget styles
         if stylesheet is DARK_STYLESHEET:
             self.image_viewer.setStyleSheet("background-color: #1e1e1e; border: 1px dashed #333; border-radius: 6px;")
             self.zoom_hint.setStyleSheet("color: #999; font-size: 11px; margin-top: 4px;")
             self.count_label.setStyleSheet("color: #cfcfcf; font-weight: bold;")
-            # Tray icon font color can't be enforced, but ensure menu actions text color uses system
         else:
             self.image_viewer.setStyleSheet("background-color: #fafafa; border: 1px dashed #ccc; border-radius: 6px;")
             self.zoom_hint.setStyleSheet("color: #999; font-size: 11px; margin-top: 4px;")
             self.count_label.setStyleSheet("color: #666; font-weight: bold;")
 
-        # Ensure flags are applied (window always on top change requires re-show)
+        # Start/stop edge hide timer
+        if self.settings.get("edge_hide_enabled", False):
+            self.edge_hide_timer.start(100)
+        else:
+            self.edge_hide_timer.stop()
+            self.edge_hide_delay_timer.stop()
+            self.edge_show_delay_timer.stop()
+            if self.is_hidden and self.original_geometry:
+                self.setGeometry(self.original_geometry)
+                self.is_hidden = False
+                self.hide_pending = False
+                self.show_pending = False
+
         self.show()
 
+    def update_ui_language(self):
+        """Update all UI text"""
+        self.setWindowTitle(f"{tr('window_title', self.current_lang)} {APP_VERSION}")
+        self.btn_settings.setToolTip(tr("settings", self.current_lang))
+        self.btn_clear.setText(tr("clear", self.current_lang))
+        self.search_box.setPlaceholderText(tr("search_placeholder", self.current_lang))
+        self.text_editor.setPlaceholderText(tr("content_preview", self.current_lang))
+        self.zoom_hint.setText(tr("zoom_hint", self.current_lang))
+        self.update_count_label()
+        self.statusBar().showMessage(tr("ready", self.current_lang))
+
     def open_settings_dialog(self):
-        dlg = SettingsDialog(self.settings, self)
+        dlg = SettingsDialog(self.settings, self.current_lang, self)
         if dlg.exec():
             new_settings = dlg.get_data()
+            old_lang = self.current_lang
             self.settings.update(new_settings)
+            self.current_lang = self.settings.get("language", "zh_CN")
             self.save_settings_to_file()
-            # Immediately apply settings including theme
+            
+            if old_lang != self.current_lang:
+                self.update_ui_language()
+            
             self.apply_settings()
-
-            # If history limit reduced, trim DB and reload
             self.db.trim_to_limit(self.max_history)
             self.refresh_history_async()
-            self.statusBar().showMessage("设置已保存", 2000)
+            self.statusBar().showMessage(tr("settings_saved", self.current_lang), 2000)
 
     # -----------------------
     # UI Setup
@@ -701,60 +1324,51 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
         # Top Bar
         top_bar = QHBoxLayout()
 
-        self.count_label = QLabel("0 Items")
+        self.count_label = QLabel(f"0 {tr('items', self.current_lang)}")
         self.count_label.setStyleSheet("color: #666; font-weight: bold;")
         top_bar.addWidget(self.count_label)
 
         top_bar.addStretch()
 
-        btn_style = "QPushButton { font-weight: bold; border-radius: 6px; }"
-
         self.btn_settings = QPushButton("⚙️")
-        self.btn_settings.setToolTip("设置")
+        self.btn_settings.setToolTip(tr("settings", self.current_lang))
         self.btn_settings.setFixedSize(36, 32)
         self.btn_settings.clicked.connect(self.open_settings_dialog)
         top_bar.addWidget(self.btn_settings)
 
-        self.btn_clear = QPushButton("清空")
-        self.btn_clear.setToolTip("Ctrl+Shift+Del")
+        self.btn_clear = QPushButton(tr("clear", self.current_lang))
         self.btn_clear.clicked.connect(self.clear_history)
         self.btn_clear.setStyleSheet("background-color: #e81123; color: white; border: none;")
         top_bar.addWidget(self.btn_clear)
-
-        self.btn_copy = QPushButton("复制")
-        self.btn_copy.setToolTip("Ctrl+Enter")
-        self.btn_copy.clicked.connect(self.copy_selected_to_system)
-        self.btn_copy.setStyleSheet("background-color: #0078D4; color: white; border: none;")
-        top_bar.addWidget(self.btn_copy)
 
         main_layout.addLayout(top_bar)
 
         # Search
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("🔍 搜索剪切板... (Ctrl+F)")
+        self.search_box.setPlaceholderText(tr("search_placeholder", self.current_lang))
         self.search_box.textChanged.connect(self.filter_history)
         main_layout.addWidget(self.search_box)
 
-        # Splitter (List / Detail)
+        # Splitter
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.setHandleWidth(8)
 
         # History List
         self.history_list = QListWidget()
         self.history_list.currentItemChanged.connect(self.on_item_selected)
-        self.history_list.itemDoubleClicked.connect(self.copy_selected_to_system)
+        self.history_list.itemClicked.connect(self.on_item_clicked)
+        self.history_list.itemDoubleClicked.connect(self.on_item_double_clicked)
         self.history_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.history_list.customContextMenuRequested.connect(self.show_context_menu)
         splitter.addWidget(self.history_list)
 
-        # Detail View Container
+        # Detail View
         self.detail_container = QWidget()
         detail_layout = QVBoxLayout(self.detail_container)
         detail_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Different Viewers
         self.text_editor = QTextEdit()
-        self.text_editor.setPlaceholderText("内容预览...")
+        self.text_editor.setPlaceholderText(tr("content_preview", self.current_lang))
         self.text_editor.textChanged.connect(self.on_text_edited)
         self.text_editor.hide()
 
@@ -764,7 +1378,7 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
         self.image_viewer.setMinimumHeight(150)
         self.image_viewer.hide()
 
-        self.zoom_hint = QLabel("💡 Ctrl+Scroll 缩放 | Ctrl+0 重置")
+        self.zoom_hint = QLabel(tr("zoom_hint", self.current_lang))
         self.zoom_hint.setStyleSheet("color: #999; font-size: 11px; margin-top: 4px;")
         self.zoom_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.zoom_hint.hide()
@@ -774,17 +1388,15 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
         detail_layout.addWidget(self.zoom_hint)
 
         splitter.addWidget(self.detail_container)
-        splitter.setSizes([350, 250]) # Default ratio
+        splitter.setSizes([350, 250])
 
         main_layout.addWidget(splitter)
-        self.statusBar().showMessage("Ready")
+        self.statusBar().showMessage(tr("ready", self.current_lang))
 
     def setup_tray(self):
-        """Initialize System Tray Icon."""
+        """Setup system tray"""
         self.tray_icon = QSystemTrayIcon(self)
 
-        # Use standard icon or fallback
-        # FIXED: use class name or self to ensure context
         if Path(resource_path("clipkeep_tray.png")).exists():
             tray_icon = QIcon(resource_path("clipkeep_tray.png"))
         else:
@@ -793,18 +1405,17 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
         self.tray_icon.setIcon(tray_icon)
 
         tray_menu = QMenu()
-
-        show_action = QAction("显示主窗口", self)
+        show_action = QAction(tr("show_window", self.current_lang), self)
         show_action.triggered.connect(self.showNormal)
         tray_menu.addAction(show_action)
 
-        settings_action = QAction("设置...", self)
+        settings_action = QAction(tr("settings", self.current_lang), self)
         settings_action.triggered.connect(self.open_settings_dialog)
         tray_menu.addAction(settings_action)
 
         tray_menu.addSeparator()
 
-        quit_action = QAction("退出 ClipKeep", self)
+        quit_action = QAction(tr("exit_app", self.current_lang), self)
         quit_action.triggered.connect(self.quit_application)
         tray_menu.addAction(quit_action)
 
@@ -821,80 +1432,87 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
                 self.activateWindow()
 
     def closeEvent(self, event):
-        """Minimize to tray instead of exiting."""
+        """Minimize to tray"""
         if self.force_quit:
             event.accept()
         else:
             event.ignore()
             self.hide()
             self.tray_icon.showMessage(
-                "ClipKeep",
-                "应用已最小化到托盘",
+                APP_NAME,
+                tr("minimized_to_tray", self.current_lang),
                 QSystemTrayIcon.MessageIcon.Information,
                 2000
             )
 
     def quit_application(self):
-        """Truly exit the application."""
+        """Exit application"""
         self.force_quit = True
         QApplication.quit()
 
     def setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+F"), self, self.search_box.setFocus)
         QShortcut(QKeySequence.StandardKey.Delete, self, self.delete_selected)
-        QShortcut(QKeySequence("Ctrl+Return"), self, self.copy_selected_to_system)
         QShortcut(QKeySequence("Escape"), self, self.clear_search)
         QShortcut(QKeySequence("Ctrl+Shift+Del"), self, self.clear_history)
-        QShortcut(QKeySequence("Return"), self.history_list, self.copy_selected_to_system)
         QShortcut(QKeySequence("Ctrl+0"), self, lambda: self.image_viewer.reset_zoom())
 
     # -----------------------
-    # Logic: Loading Data (Async)
+    # Data Loading
     # -----------------------
     def refresh_history_async(self):
-        """Load history list via ThreadPool."""
+        """Load history list"""
         worker = DBWorker(self.db_path, "load_all", limit=self.max_history)
         worker.signals.result.connect(self.on_history_loaded)
         self.threadpool.start(worker)
+
+    def strip_html_tags(self, html: str) -> str:
+        """Remove HTML tags"""
+        try:
+            html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<[^>]+>', '', html)
+            html = html.replace('&nbsp;', ' ').replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+            html = re.sub(r'\s+', ' ', html).strip()
+            return html
+        except:
+            return html[:100]
 
     def on_history_loaded(self, records: List[ClipboardRecord]):
         self.history_list.clear()
 
         for rec in records:
-            # Determine display text and icon
             if rec.type == "text":
                 if rec.format == "file":
-                    # File List
                     line_count = rec.content.count('\n') + 1
-                    display_text = f"📂 文件列表 ({line_count} items): " + rec.content.split('\n')[0]
+                    first_file = rec.content.split('\n')[0] if rec.content else ""
+                    file_name = Path(first_file).name if first_file else "..."
+                    display_text = f"{tr('file_list', self.current_lang)} ({line_count}): {file_name}"
                     icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
                 elif rec.format == "html":
-                    display_text = "🌐 富文本 (HTML)"
+                    plain_text = self.strip_html_tags(rec.content)
+                    preview = plain_text[:80].replace("\n", " ")
+                    display_text = tr("rich_text_prefix", self.current_lang) + preview
                     icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
                 else:
-                    # Plain Text
                     display_text = rec.content[:80].replace("\n", " ")
-                    icon = QIcon() # Default no icon
+                    icon = QIcon()
 
                 item = QListWidgetItem(display_text)
                 item.setData(ROLE_TYPE, "text")
 
             elif rec.type == "image":
-                # Create icon from thumbnail bytes
                 pix = QPixmap()
                 if rec.thumbnail:
                     pix.loadFromData(rec.thumbnail)
-                else:
-                    # fallback in case content_blob is present; DBWorker didn't return content_blob for list
-                    pix = QPixmap()
                 icon = QIcon(pix)
-                item = QListWidgetItem(f"🖼️ 图片")
+                item = QListWidgetItem(tr("image", self.current_lang))
                 item.setData(ROLE_TYPE, "image")
 
-            # Common Data
             item.setData(ROLE_RECORD_ID, rec.id)
             item.setData(ROLE_TIMESTAMP, rec.timestamp)
             item.setData(ROLE_FORMAT, rec.format)
+            item.setData(ROLE_CONTENT_HASH, rec.content_hash)
             item.setIcon(icon)
 
             self.history_list.addItem(item)
@@ -902,14 +1520,13 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
         self.update_count_label()
 
     def on_item_selected(self, current, previous):
-        """Trigger async load of details."""
+        """Load detail when item selected"""
         if not current:
             self.clear_detail_view()
             return
 
         record_id = current.data(ROLE_RECORD_ID)
 
-        # UI Feedback
         self.text_editor.hide()
         self.image_viewer.hide()
         self.zoom_hint.hide()
@@ -945,182 +1562,244 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
         self.current_record = None
 
     # -----------------------
-    # Logic: Clipboard Capture
+    # Clipboard Operations
     # -----------------------
+    def on_item_clicked(self, item):
+        """Single click to copy"""
+        self.copy_selected_to_system()
+
+    def on_item_double_clicked(self, item):
+        """Double click to open"""
+        if not self.current_record:
+            return
+
+        if self.current_record.type == "text" and self.current_record.format == "file":
+            self.open_file_path()
+        elif self.current_record.type == "image":
+            self.open_temp_image()
+
     def on_clipboard_change(self):
         if self.is_internal_copy:
             self.is_internal_copy = False
             return
 
         mime_data = self.clipboard.mimeData()
-
-        # Priority 1: File Paths (if enabled)
-        if self.settings.get("enable_file_paths") and mime_data.hasUrls():
-            urls = mime_data.urls()
-            # Filter for local files
-            local_files = [u.toLocalFile() for u in urls if u.isLocalFile()]
-            if local_files:
-                content = "\n".join(local_files)
-                self.add_text_record(content, "file")
-                return
-
-        # Priority 2: Images
+        
+        # Priority 1: Images
         if mime_data.hasImage():
             image = self.clipboard.image()
             if not image.isNull():
-                self.add_image_record(image)
+                byte_array = QByteArray()
+                buffer = QBuffer(byte_array)
+                buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+                image.save(buffer, "PNG")
+                buffer.close()
+                current_hash = hashlib.md5(byte_array.data()).hexdigest()
+                
+                if current_hash != self.last_clipboard_hash and not self.db.check_duplicate_hash(current_hash):
+                    self.last_clipboard_hash = current_hash
+                    self.add_image_record_async(image)
                 return
 
-        # Priority 3: HTML (if enabled)
+        # Priority 2: Files
+        if self.settings.get("enable_file_paths") and mime_data.hasUrls():
+            urls = mime_data.urls()
+            local_files = [u.toLocalFile() for u in urls if u.isLocalFile()]
+            if local_files:
+                content = "\n".join(local_files)
+                current_hash = hashlib.md5(content.encode()).hexdigest()
+                
+                if current_hash != self.last_clipboard_hash and not self.db.check_duplicate_hash(current_hash):
+                    self.last_clipboard_hash = current_hash
+                    self.add_text_record(content, "file")
+                return
+
+        # Priority 3: HTML
         if self.settings.get("enable_rich_text") and mime_data.hasHtml():
             html_content = mime_data.html()
-            # Avoid storing empty html wrappers
             if len(html_content) > 20:
-                self.add_text_record(html_content, "html")
+                current_hash = hashlib.md5(html_content.encode()).hexdigest()
+                
+                if current_hash != self.last_clipboard_hash and not self.db.check_duplicate_hash(current_hash):
+                    self.last_clipboard_hash = current_hash
+                    self.add_text_record(html_content, "html")
                 return
 
-        # Priority 4: Plain Text
+        # Priority 4: Text
         if mime_data.hasText():
             text = self.clipboard.text().strip()
             if text:
-                # Check duplication logic in DB or simple recently check
-                if not self._is_duplicate(text):
+                current_hash = hashlib.md5(text.encode()).hexdigest()
+                
+                if current_hash != self.last_clipboard_hash and not self.db.check_duplicate_hash(current_hash):
+                    self.last_clipboard_hash = current_hash
                     self.add_text_record(text, "plain")
 
-    def _is_duplicate(self, text: str) -> bool:
-        # Check first item in list
-        if self.history_list.count() > 0:
-            item = self.history_list.item(0)
-            if item.data(ROLE_TYPE) == "text":
-                # Need to check content. Since list item only has preview,
-                # we rely on DB or cache. For simplicity, just check preview text equality
-                preview = text[:80].replace("\n", " ")
-                if item.text() == preview:
-                    return True
-        return False
-
     def add_text_record(self, text: str, fmt: str):
-        self.db.add_text_record(text, fmt)
-        self.db.trim_to_limit(self.max_history)
+        try:
+            self.db.add_text_record(text, fmt)
+            self.db.trim_to_limit(self.max_history)
+            self.refresh_history_async()
+        except Exception as e:
+            print(f"Add text error: {e}")
+
+    def add_image_record_async(self, image: QImage):
+        """Add image using worker thread"""
+        try:
+            worker = ImageProcessWorker(
+                image,
+                self.db_path,
+                MAX_IMAGE_AREA_PIXELS,
+                self.settings.get("save_original_image", False)
+            )
+            worker.signals.result.connect(self.on_image_saved)
+            worker.signals.finished.connect(lambda: self.db.trim_to_limit(self.max_history))
+            self.threadpool.start(worker)
+        except Exception as e:
+            print(f"Add image error: {e}")
+
+    def on_image_saved(self, content_hash: str):
+        """Called when image is saved"""
         self.refresh_history_async()
 
-    def add_image_record(self, image: QImage):
-        # Resize Logic if not "Save Original"
-        persist_image = image
-        if not self.settings.get("save_original_image"):
-            area = image.width() * image.height()
-            if area > MAX_IMAGE_AREA_PIXELS:
-                scale_factor = (MAX_IMAGE_AREA_PIXELS / area) ** 0.5
-                new_width = int(image.width() * scale_factor)
-                new_height = int(image.height() * scale_factor)
-                persist_image = image.scaled(
-                    new_width, new_height,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-
-        # Generate Thumbnail
-        thumb = persist_image.scaled(
-            THUMBNAIL_SIZE, THUMBNAIL_SIZE,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        byte_array = QByteArray()
-        buffer = QBuffer(byte_array)
-        buffer.open(QBuffer.OpenModeFlag.WriteOnly)
-        thumb.save(buffer, "PNG")
-        buffer.close()
-
-        has_alpha = persist_image.hasAlphaChannel()
-        fmt = "PNG" if has_alpha else "JPEG"
-
-        self.db.add_image_record(persist_image, byte_array.data(), fmt)
-        self.db.trim_to_limit(self.max_history)
-        self.refresh_history_async()
-
-    # -----------------------
-    # Logic: Copy / Delete
-    # -----------------------
     def copy_selected_to_system(self):
         if not self.current_record:
             return
 
-        self.is_internal_copy = True
-        # For simplicity using clipboard API directly
-        if self.current_record.type == "text":
-            if self.current_record.format == "html":
-                # Copy both text and html
-                mime_data = self.clipboard.mimeData()
-                mime_data.setHtml(self.current_record.content)
-                # Strip tags for plain text fallback
-                doc = QTextEdit()
-                doc.setHtml(self.current_record.content)
-                mime_data.setText(doc.toPlainText())
-                self.clipboard.setMimeData(mime_data)
-                self.statusBar().showMessage("✓ 已复制富文本", 2000)
-            elif self.current_record.format == "file":
-                # Create URLs
-                urls = []
-                paths = self.current_record.content.split('\n')
-                for p in paths:
-                    if p.strip():
-                        urls.append(QUrl.fromLocalFile(p.strip()))
+        try:
+            self.is_internal_copy = True
+            
+            if self.current_record.type == "text":
+                if self.current_record.format == "html":
+                    # 创建新的 MimeData 对象
+                    mime_data = QMimeData()
+                    mime_data.setHtml(self.current_record.content)
+                    # 同时设置纯文本作为后备
+                    plain_text = self.strip_html_tags(self.current_record.content)
+                    mime_data.setText(plain_text)
+                    self.clipboard.setMimeData(mime_data)
+                    self.statusBar().showMessage(tr("copied_html", self.current_lang), 2000)
+                elif self.current_record.format == "file":
+                    urls = []
+                    paths = self.current_record.content.split('\n')
+                    for p in paths:
+                        if p.strip():
+                            urls.append(QUrl.fromLocalFile(p.strip()))
 
-                mime_data = self.clipboard.mimeData()
-                mime_data.setUrls(urls)
-                mime_data.setText(self.current_record.content) # Fallback text
-                self.clipboard.setMimeData(mime_data)
-                self.statusBar().showMessage("✓ 已复制文件路径", 2000)
+                    mime_data = QMimeData()
+                    mime_data.setUrls(urls)
+                    mime_data.setText(self.current_record.content)
+                    self.clipboard.setMimeData(mime_data)
+                    self.statusBar().showMessage(tr("copied_file", self.current_lang), 2000)
+                else:
+                    self.clipboard.setText(self.current_record.content)
+                    self.statusBar().showMessage(tr("copied_text", self.current_lang), 2000)
+
+            elif self.current_record.type == "image":
+                self.clipboard.setImage(self.current_record.content)
+                self.statusBar().showMessage(tr("copied_image", self.current_lang), 2000)
+        except Exception as e:
+            print(f"Copy error: {e}")
+            traceback.print_exc()
+            self.statusBar().showMessage(f"Copy failed: {str(e)}", 3000)
+
+    def open_file_path(self):
+        """Open file with default app"""
+        try:
+            if not self.current_record or self.current_record.format != "file":
+                return
+
+            paths = self.current_record.content.split('\n')
+            for path_str in paths:
+                path_str = path_str.strip()
+                if not path_str:
+                    continue
+                
+                file_path = Path(path_str)
+                if file_path.exists():
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(file_path)))
+                else:
+                    QMessageBox.warning(
+                        self,
+                        tr("open_failed", self.current_lang),
+                        f"{tr('file_not_found', self.current_lang)}: {path_str}"
+                    )
+                break
+        except Exception as e:
+            print(f"Open file error: {e}")
+            QMessageBox.warning(self, tr("open_failed", self.current_lang), str(e))
+
+    def open_temp_image(self):
+        """Open image in default viewer"""
+        try:
+            if not self.current_record or self.current_record.type != "image":
+                return
+            
+            if not isinstance(self.current_record.content, QImage):
+                return
+
+            fmt = self.current_record.format.lower()
+            temp_file = self.temp_manager.get_temp_file(self.current_record.id, fmt)
+            
+            # Save and release
+            success = self.current_record.content.save(str(temp_file), self.current_record.format)
+            
+            if success:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(temp_file)))
             else:
-                self.clipboard.setText(self.current_record.content)
-                self.statusBar().showMessage("✓ 已复制文本", 2000)
-
-        elif self.current_record.type == "image":
-            self.clipboard.setImage(self.current_record.content)
-            self.statusBar().showMessage("✓ 已复制图片", 2000)
+                QMessageBox.warning(self, tr("open_failed", self.current_lang), "Failed to save temp image")
+                
+        except Exception as e:
+            print(f"Open image error: {e}")
+            QMessageBox.warning(self, tr("open_failed", self.current_lang), str(e))
 
     def delete_selected(self):
         item = self.history_list.currentItem()
         if not item:
             return
 
-        row = self.history_list.row(item)
-        record_id = item.data(ROLE_RECORD_ID)
+        try:
+            row = self.history_list.row(item)
+            record_id = item.data(ROLE_RECORD_ID)
 
-        self.db.delete_record(record_id)
-        self.history_list.takeItem(row)
-        self.clear_detail_view()
-        self.update_count_label()
-        self.statusBar().showMessage("已删除", 1500)
+            self.db.delete_record(record_id)
+            self.history_list.takeItem(row)
+            self.clear_detail_view()
+            self.update_count_label()
+            self.statusBar().showMessage(tr("deleted", self.current_lang), 1500)
+        except Exception as e:
+            print(f"Delete error: {e}")
 
     def clear_history(self):
         if self.db.get_count() == 0:
             return
 
         reply = QMessageBox.question(
-            self, "确认清空",
-            "确定要删除所有记录吗？此操作不可恢复。",
+            self, tr("confirm_clear", self.current_lang),
+            tr("confirm_clear_msg", self.current_lang),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self.db.clear_all()
-            self.history_list.clear()
-            self.clear_detail_view()
-            self.update_count_label()
-            self.statusBar().showMessage("历史已清空", 2000)
+            try:
+                self.db.clear_all()
+                self.history_list.clear()
+                self.clear_detail_view()
+                self.update_count_label()
+                self.statusBar().showMessage(tr("history_cleared", self.current_lang), 2000)
+            except Exception as e:
+                print(f"Clear error: {e}")
 
     # -----------------------
-    # Helper / Event Overrides
+    # UI Helpers
     # -----------------------
     def update_count_label(self):
         count = self.history_list.count()
-        self.count_label.setText(f"历史: {count} / {self.max_history}")
+        self.count_label.setText(f"{tr('items', self.current_lang)}: {count} / {self.max_history}")
 
     def filter_history(self, text):
         search_text = text.lower()
         for i in range(self.history_list.count()):
             item = self.history_list.item(i)
-            # Search in text or format tag
             item_text = item.text().lower()
             match = search_text in item_text
             item.setHidden(not match)
@@ -1135,10 +1814,15 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
             return
 
         menu = QMenu(self)
-        menu.addAction("📋 复制", self.copy_selected_to_system)
-        menu.addAction("🗑️ 删除", self.delete_selected)
+        
+        rec_type = item.data(ROLE_TYPE)
+        rec_format = item.data(ROLE_FORMAT)
+        if (rec_type == "text" and rec_format == "file") or rec_type == "image":
+            menu.addAction(tr("context_open", self.current_lang), 
+                         lambda: self.on_item_double_clicked(item))
+        
+        menu.addAction(tr("context_delete", self.current_lang), self.delete_selected)
 
-        # Info
         ts = item.data(ROLE_TIMESTAMP)
         time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
         info_action = QAction(f"⏰ {time_str}", self)
@@ -1149,41 +1833,51 @@ class ClipKeepApp(QMainWindow):  # <--- FIXED: Added the missing class definitio
         menu.exec(self.history_list.mapToGlobal(pos))
 
     def on_text_edited(self):
-        """Save text changes with debounce."""
+        """Save text with debounce"""
         if not self.current_record or self.current_record.type != "text":
             return
 
-        # We only allow editing plain text or HTML source easily.
-        if self.current_record.format == "html":
-            new_text = self.text_editor.toHtml()
-        else:
-            new_text = self.text_editor.toPlainText()
+        try:
+            if self.current_record.format == "html":
+                new_text = self.text_editor.toHtml()
+            else:
+                new_text = self.text_editor.toPlainText()
 
-        self._pending_save_id = self.current_record.id
-        self._pending_save_text = new_text
-        self._save_timer.start(SAVE_DEBOUNCE_MS)
+            self._pending_save_id = self.current_record.id
+            self._pending_save_text = new_text
+            self._save_timer.start(SAVE_DEBOUNCE_MS)
+        except Exception as e:
+            print(f"Text edit error: {e}")
 
     def _do_save_pending(self):
         if self._pending_save_id and self._pending_save_text is not None:
-            self.db.update_text_content(self._pending_save_id, self._pending_save_text)
-            self._pending_save_id = None
-            self._pending_save_text = None
-            self.statusBar().showMessage("已自动保存更改", 1000)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._resize_timer.start(RESIZE_DEBOUNCE_MS)
-
-    def _on_resize_complete(self):
-        pass
+            try:
+                self.db.update_text_content(self._pending_save_id, self._pending_save_text)
+                self._pending_save_id = None
+                self._pending_save_text = None
+                self.statusBar().showMessage(tr("auto_saved", self.current_lang), 1000)
+            except Exception as e:
+                print(f"Save error: {e}")
 
 if __name__ == "__main__":
+    # Single instance check
+    server = ClipKeepApp.create_single_instance_server()
+    if server is None:
+        app = QApplication(sys.argv)
+        QMessageBox.warning(
+            None,
+            tr("already_running", "zh_CN"),
+            tr("already_running_msg", "zh_CN")
+        )
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setQuitOnLastWindowClosed(False)
 
     try:
         app_icon = QIcon(resource_path("clipkeep.ico"))
-    except Exception:
+    except:
         app_icon = app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
     app.setWindowIcon(app_icon)
 
