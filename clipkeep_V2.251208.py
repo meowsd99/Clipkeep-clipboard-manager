@@ -26,9 +26,9 @@ from PyQt6.QtGui import (
 from PyQt6.QtCore import (
     Qt, QTimer, QByteArray, QBuffer, QSize, QUrl,
     QThreadPool, QRunnable, QObject, pyqtSignal, pyqtSlot,
-    QPoint, QRect, QPropertyAnimation, QEasingCurve,
-    QLocalServer, QLocalSocket
+    QPoint, QRect, QPropertyAnimation, QEasingCurve, QMimeData
 )
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 def resource_path(relative_path):
     """PyInstaller safe resource loading"""
@@ -58,8 +58,10 @@ THUMBNAIL_SIZE = 64
 # Edge hide settings
 EDGE_HIDE_THRESHOLD = 5
 EDGE_SHOW_WIDTH = 3
-EDGE_DETECT_AREA = 20
+EDGE_DETECT_AREA = 30  # 增加检测区域
 ANIMATION_DURATION = 250
+EDGE_HIDE_DELAY_MS = 1500  # 贴边后等待1.5秒再隐藏
+EDGE_SHOW_DELAY_MS = 300   # 光标靠近后等待0.3秒再显示
 
 # Temp cleanup settings
 TEMP_CLEANUP_DAYS = 1
@@ -967,8 +969,20 @@ class ClipKeepApp(QMainWindow):
         self.is_hidden = False
         self.original_geometry = None
         self.hide_animation = None
+        self.at_edge_time = None  # 记录到达边缘的时间
+        self.hide_pending = False  # 是否有待执行的隐藏
+        self.show_pending = False  # 是否有待执行的显示
+        
         self.edge_hide_timer = QTimer()
         self.edge_hide_timer.timeout.connect(self.check_edge_hide)
+        
+        self.edge_hide_delay_timer = QTimer()
+        self.edge_hide_delay_timer.setSingleShot(True)
+        self.edge_hide_delay_timer.timeout.connect(self.execute_hide)
+        
+        self.edge_show_delay_timer = QTimer()
+        self.edge_show_delay_timer.setSingleShot(True)
+        self.edge_show_delay_timer.timeout.connect(self.execute_show)
 
         # Timers
         self._save_timer = QTimer()
@@ -1053,26 +1067,78 @@ class ClipKeepApp(QMainWindow):
         if not self.isVisible() or self.isMinimized():
             return
 
+        # 如果正在播放动画，不做任何检查
+        if self.hide_animation and self.hide_animation.state() == QPropertyAnimation.State.Running:
+            return
+
         screen = QApplication.primaryScreen().geometry()
         win_geo = self.geometry()
         cursor_pos = QCursor.pos()
 
+        # 检查窗口是否在边缘
         at_left_edge = win_geo.x() <= EDGE_HIDE_THRESHOLD
         at_right_edge = win_geo.x() + win_geo.width() >= screen.width() - EDGE_HIDE_THRESHOLD
         at_top_edge = win_geo.y() <= EDGE_HIDE_THRESHOLD
-
         at_edge = at_left_edge or at_right_edge or at_top_edge
 
-        if at_edge and not self.is_hidden:
-            if not win_geo.contains(cursor_pos):
-                self.hide_to_edge_animated()
-        elif self.is_hidden:
+        if not self.is_hidden:
+            # 窗口未隐藏状态
+            if at_edge:
+                # 窗口在边缘
+                cursor_in_window = win_geo.contains(cursor_pos)
+                
+                if cursor_in_window:
+                    # 光标在窗口内，取消任何待执行的隐藏
+                    self.at_edge_time = None
+                    self.hide_pending = False
+                    self.edge_hide_delay_timer.stop()
+                else:
+                    # 光标不在窗口内，开始计时准备隐藏
+                    if not self.hide_pending:
+                        self.hide_pending = True
+                        self.edge_hide_delay_timer.start(EDGE_HIDE_DELAY_MS)
+            else:
+                # 窗口不在边缘，取消隐藏
+                self.at_edge_time = None
+                self.hide_pending = False
+                self.edge_hide_delay_timer.stop()
+        else:
+            # 窗口已隐藏状态
+            # 检查光标是否靠近隐藏区域
+            cursor_near = False
+            
             if at_left_edge and cursor_pos.x() <= EDGE_DETECT_AREA:
-                self.show_from_edge_animated()
+                cursor_near = True
             elif at_right_edge and cursor_pos.x() >= screen.width() - EDGE_DETECT_AREA:
-                self.show_from_edge_animated()
+                cursor_near = True
             elif at_top_edge and cursor_pos.y() <= EDGE_DETECT_AREA:
-                self.show_from_edge_animated()
+                cursor_near = True
+            
+            if cursor_near:
+                # 光标靠近，准备显示
+                if not self.show_pending:
+                    self.show_pending = True
+                    self.edge_show_delay_timer.start(EDGE_SHOW_DELAY_MS)
+            else:
+                # 光标远离，取消显示
+                self.show_pending = False
+                self.edge_show_delay_timer.stop()
+
+    def execute_hide(self):
+        """执行隐藏动画"""
+        self.hide_pending = False
+        
+        # 再次检查光标位置，确保光标确实不在窗口内
+        cursor_pos = QCursor.pos()
+        if self.geometry().contains(cursor_pos):
+            return  # 光标回到窗口内，取消隐藏
+        
+        self.hide_to_edge_animated()
+
+    def execute_show(self):
+        """执行显示动画"""
+        self.show_pending = False
+        self.show_from_edge_animated()
 
     def hide_to_edge_animated(self):
         """Hide window to edge with smooth animation"""
@@ -1124,6 +1190,9 @@ class ClipKeepApp(QMainWindow):
         """Called when show animation finishes"""
         self.is_hidden = False
         self.hide_animation = None
+        # 显示完成后，重置状态，允许再次隐藏
+        self.at_edge_time = None
+        self.hide_pending = False
 
     # -----------------------
     # Settings Management
@@ -1204,9 +1273,13 @@ class ClipKeepApp(QMainWindow):
             self.edge_hide_timer.start(100)
         else:
             self.edge_hide_timer.stop()
+            self.edge_hide_delay_timer.stop()
+            self.edge_show_delay_timer.stop()
             if self.is_hidden and self.original_geometry:
                 self.setGeometry(self.original_geometry)
                 self.is_hidden = False
+                self.hide_pending = False
+                self.show_pending = False
 
         self.show()
 
@@ -1598,11 +1671,12 @@ class ClipKeepApp(QMainWindow):
             
             if self.current_record.type == "text":
                 if self.current_record.format == "html":
-                    mime_data = self.clipboard.mimeData()
+                    # 创建新的 MimeData 对象
+                    mime_data = QMimeData()
                     mime_data.setHtml(self.current_record.content)
-                    doc = QTextEdit()
-                    doc.setHtml(self.current_record.content)
-                    mime_data.setText(doc.toPlainText())
+                    # 同时设置纯文本作为后备
+                    plain_text = self.strip_html_tags(self.current_record.content)
+                    mime_data.setText(plain_text)
                     self.clipboard.setMimeData(mime_data)
                     self.statusBar().showMessage(tr("copied_html", self.current_lang), 2000)
                 elif self.current_record.format == "file":
@@ -1612,7 +1686,7 @@ class ClipKeepApp(QMainWindow):
                         if p.strip():
                             urls.append(QUrl.fromLocalFile(p.strip()))
 
-                    mime_data = self.clipboard.mimeData()
+                    mime_data = QMimeData()
                     mime_data.setUrls(urls)
                     mime_data.setText(self.current_record.content)
                     self.clipboard.setMimeData(mime_data)
@@ -1626,6 +1700,8 @@ class ClipKeepApp(QMainWindow):
                 self.statusBar().showMessage(tr("copied_image", self.current_lang), 2000)
         except Exception as e:
             print(f"Copy error: {e}")
+            traceback.print_exc()
+            self.statusBar().showMessage(f"Copy failed: {str(e)}", 3000)
 
     def open_file_path(self):
         """Open file with default app"""
