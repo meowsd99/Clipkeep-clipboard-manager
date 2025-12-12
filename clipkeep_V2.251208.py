@@ -4,12 +4,27 @@ import sqlite3
 import json
 import traceback
 import re
+import logging
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 import os
 import hashlib
 import shutil
+
+# 确保配置目录存在
+config_dir = Path.home() / ".clipkeep"
+config_dir.mkdir(exist_ok=True)
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(config_dir / "clipkeep.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -21,12 +36,13 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import (
     QIcon, QAction, QPixmap, QImage, QKeySequence,
-    QShortcut, QWheelEvent, QDesktopServices, QPalette, QColor, QCursor
+    QShortcut, QWheelEvent, QDesktopServices, QPalette, QColor, QCursor, QDrag
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QByteArray, QBuffer, QSize, QUrl,
     QThreadPool, QRunnable, QObject, pyqtSignal, pyqtSlot,
-    QPoint, QRect, QPropertyAnimation, QEasingCurve, QMimeData
+    QPoint, QRect, QPropertyAnimation, QEasingCurve, QMimeData,
+    QSortFilterProxyModel, QRegularExpression
 )
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -62,6 +78,7 @@ EDGE_DETECT_AREA = 30  # 增加检测区域
 ANIMATION_DURATION = 250
 EDGE_HIDE_DELAY_MS = 1500  # 贴边后等待1.5秒再隐藏
 EDGE_SHOW_DELAY_MS = 300   # 光标靠近后等待0.3秒再显示
+EDGE_SNAP_DISTANCE = 30
 
 # Temp cleanup settings
 TEMP_CLEANUP_DAYS = 1
@@ -78,7 +95,7 @@ TRANSLATIONS = {
         "clear": "清空",
         "search_placeholder": "🔍 搜索剪切板... (Ctrl+F)",
         "content_preview": "内容预览...",
-        "zoom_hint": "💡 Ctrl+Scroll 缩放 | Ctrl+0 重置",
+        "zoom_hint": "💡 Ctrl+鼠标滚轮 缩放 | Ctrl+0 重置",
         "ready": "Ready",
         "settings_title": "设置",
         "always_on_top": "窗口置顶 (Always on Top)",
@@ -193,7 +210,7 @@ QMainWindow {
     background-color: #f3f3f3;
 }
 QWidget {
-    font-family: 'Segoe UI', sans-serif;
+    font-family: 'Microsoft YaHei', 'Arial', sans-serif;
     font-size: 14px;
     color: #333;
 }
@@ -261,7 +278,7 @@ QMainWindow {
     background-color: #1f1f1f;
 }
 QWidget {
-    font-family: 'Segoe UI', sans-serif;
+    font-family: 'Microsoft YaHei', 'Arial', sans-serif;
     font-size: 14px;
     color: #e8e8e8;
 }
@@ -379,22 +396,28 @@ class ClipboardDatabase:
             """)
             self.conn.commit()
         except Exception as e:
-            print(f"Database init error: {e}")
+            logging.error(f"Database init error: {e}", exc_info=True)
             raise
 
     def test_write(self) -> bool:
         """Test database write capability"""
+        conn = None
         try:
-            cursor = self.conn.cursor()
+            conn = sqlite3.connect(str(self.db_path))
+            cursor = conn.cursor()
             cursor.execute("INSERT INTO records (type, content, timestamp, format) VALUES (?, ?, ?, ?)",
                           ("text", "_test_", datetime.now().timestamp(), "plain"))
             test_id = cursor.lastrowid
-            self.conn.commit()
+            conn.commit()
             cursor.execute("DELETE FROM records WHERE id = ?", (test_id,))
-            self.conn.commit()
+            conn.commit()
             return True
-        except:
+        except Exception as e:
+            logging.error(f"Database test write error: {e}", exc_info=True)
             return False
+        finally:
+            if conn:
+                conn.close()
 
     def add_text_record(self, text: str, record_format: str = "plain") -> int:
         try:
@@ -738,12 +761,16 @@ class TempFileManager:
             
             for item in self.base_dir.iterdir():
                 if item.is_dir() and item.name.startswith("session_"):
-                    # Check modification time
-                    mtime = datetime.fromtimestamp(item.stat().st_mtime)
-                    if mtime < cutoff_time:
-                        shutil.rmtree(item, ignore_errors=True)
+                    try:
+                        # Check modification time
+                        mtime = datetime.fromtimestamp(item.stat().st_mtime)
+                        if mtime < cutoff_time:
+                            shutil.rmtree(item, ignore_errors=True)
+                    except (PermissionError, OSError):
+                        # 文件被占用时跳过
+                        continue
         except Exception as e:
-            print(f"Cleanup error: {e}")
+            logging.warning(f"Cleanup temp files warning: {e}")
 
     def get_temp_file(self, record_id: int, fmt: str) -> Path:
         """Get temp file path for a record"""
@@ -754,6 +781,83 @@ class TempFileManager:
 # -----------------------
 # Custom Widgets
 # -----------------------
+class DraggableListWidget(QListWidget):
+    """支持拖拽内容的列表控件"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_app = None
+    
+    def startDrag(self, supportedActions):
+        """开始拖拽操作"""
+        try:
+            item = self.currentItem()
+            if not item or not self.parent_app:
+                return
+            
+            # 获取当前记录
+            record_id = item.data(ROLE_RECORD_ID)
+            rec_type = item.data(ROLE_TYPE)
+            rec_format = item.data(ROLE_FORMAT)
+            
+            # 异步加载详细内容
+            worker = DBWorker(self.parent_app.db_path, "get_detail", record_id=record_id)
+            worker.signals.result.connect(lambda record: self._perform_drag(record, supportedActions))
+            self.parent_app.threadpool.start(worker)
+            
+        except Exception as e:
+            logging.error(f"Start drag error: {e}", exc_info=True)
+    
+    def _perform_drag(self, record, supportedActions):
+        """执行拖拽"""
+        try:
+            if not record:
+                return
+            
+            mime_data = QMimeData()
+            
+            if record.type == "text":
+                if record.format == "html":
+                    # 富文本：同时设置HTML和纯文本
+                    mime_data.setHtml(record.content)
+                    if hasattr(self.parent_app, 'strip_html_tags'):
+                        plain_text = self.parent_app.strip_html_tags(record.content)
+                        mime_data.setText(plain_text)
+                    else:
+                        mime_data.setText(record.content)
+                elif record.format == "file":
+                    # 文件路径
+                    urls = []
+                    for p in record.content.split('\n'):
+                        if p.strip():
+                            urls.append(QUrl.fromLocalFile(p.strip()))
+                    mime_data.setUrls(urls)
+                    mime_data.setText(record.content)
+                else:
+                    # 纯文本
+                    mime_data.setText(record.content)
+            
+            elif record.type == "image":
+                # 图片
+                mime_data.setImageData(record.content)
+            
+            # 创建拖拽对象
+            drag = QDrag(self)
+            drag.setMimeData(mime_data)
+            
+            # 设置拖拽图标（缩略图）
+            current_item = self.currentItem()
+            if current_item:
+                icon = current_item.icon()
+                if not icon.isNull():
+                    pixmap = icon.pixmap(64, 64)
+                    drag.setPixmap(pixmap)
+            
+            # 执行拖拽
+            drag.exec(supportedActions)
+            
+        except Exception as e:
+            logging.error(f"Perform drag error: {e}", exc_info=True)
+
 class ZoomableImageLabel(QLabel):
     """Scalable image viewer with mouse wheel support."""
     def __init__(self, parent=None):
@@ -937,9 +1041,7 @@ class ClipKeepApp(QMainWindow):
         # Core Setup
         self.current_lang = "zh_CN"
         self.setWindowTitle(f"{tr('window_title', self.current_lang)} {APP_VERSION}")
-        self.resize(550, 700)
-        self.setMinimumSize(400, 500)
-
+        
         # Configuration
         self.config_dir = Path.home() / ".clipkeep"
         self.config_dir.mkdir(exist_ok=True)
@@ -950,6 +1052,21 @@ class ClipKeepApp(QMainWindow):
         self.settings = self.load_settings()
         self.current_lang = self.settings.get("language", "zh_CN")
         self.max_history = self.settings.get("max_history", DEFAULT_MAX_HISTORY)
+
+        # Load window geometry from settings
+        saved_geometry = self.settings.get("window_geometry")
+        if saved_geometry:
+            self.setGeometry(
+                saved_geometry.get("x", 100),
+                saved_geometry.get("y", 100),
+                saved_geometry.get("width", 550),
+                saved_geometry.get("height", 700)
+            )
+        else:
+            # Default to minimum size on first launch
+            self.resize(400, 500)
+        
+        self.setMinimumSize(400, 500)
 
         # Temp file manager
         self.temp_manager = TempFileManager(self.temp_dir)
@@ -964,6 +1081,7 @@ class ClipKeepApp(QMainWindow):
         self.force_quit = False
         self.current_record: Optional[ClipboardRecord] = None
         self.last_clipboard_hash = ""
+        self.tray_message_shown = False  # 托盘提示是否已显示过
 
         # Edge Hide State
         self.is_hidden = False
@@ -1080,6 +1198,33 @@ class ClipKeepApp(QMainWindow):
         at_right_edge = win_geo.x() + win_geo.width() >= screen.width() - EDGE_HIDE_THRESHOLD
         at_top_edge = win_geo.y() <= EDGE_HIDE_THRESHOLD
         at_edge = at_left_edge or at_right_edge or at_top_edge
+
+        # 检查是否应该吸附到边缘
+        if not at_edge and not self.is_hidden:
+            near_left = 0 < win_geo.x() <= EDGE_SNAP_DISTANCE
+            near_right = screen.width() - EDGE_SNAP_DISTANCE <= win_geo.x() + win_geo.width() < screen.width()
+            near_top = 0 < win_geo.y() <= EDGE_SNAP_DISTANCE
+            
+            if near_left or near_right or near_top:
+                # 执行吸附
+                snap_geo = QRect(win_geo)
+                if near_left:
+                    snap_geo.moveLeft(0)
+                elif near_right:
+                    snap_geo.moveLeft(screen.width() - win_geo.width())
+                elif near_top:
+                    snap_geo.moveTop(0)
+                
+                # 平滑吸附动画
+                if not self.hide_animation:
+                    self.hide_animation = QPropertyAnimation(self, b"geometry")
+                    self.hide_animation.setDuration(150)
+                    self.hide_animation.setStartValue(win_geo)
+                    self.hide_animation.setEndValue(snap_geo)
+                    self.hide_animation.setEasingCurve(QEasingCurve.Type.OutQuad)
+                    self.hide_animation.finished.connect(lambda: setattr(self, 'hide_animation', None))
+                    self.hide_animation.start()
+                return
 
         if not self.is_hidden:
             # 窗口未隐藏状态
@@ -1219,10 +1364,37 @@ class ClipKeepApp(QMainWindow):
 
     def save_settings_to_file(self):
         try:
+            # 只在窗口可见且未隐藏时保存几何信息
+            if self.isVisible() and not self.is_hidden:
+                geo = self.geometry()
+                screen = QApplication.primaryScreen().geometry()
+                
+                # 检查窗口是否在屏幕内
+                window_in_screen = (
+                    geo.x() >= 0 and 
+                    geo.y() >= 0 and
+                    geo.x() + geo.width() <= screen.width() and
+                    geo.y() + geo.height() <= screen.height()
+                )
+                
+                # 只有窗口完全在屏幕内才保存
+                if window_in_screen:
+                    self.settings["window_geometry"] = {
+                        "x": geo.x(),
+                        "y": geo.y(),
+                        "width": geo.width(),
+                        "height": geo.height()
+                    }
+                    logging.info(f"Saved window geometry: {geo.x()}, {geo.y()}, {geo.width()}x{geo.height()}")
+                else:
+                    logging.warning("Window outside screen bounds, not saving geometry")
+            else:
+                logging.info("Window hidden or invisible, not saving geometry")
+            
             with open(self.settings_file, 'w', encoding='utf-8') as f:
                 json.dump(self.settings, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"Error saving settings: {e}")
+            logging.error(f"Error saving settings: {e}", exc_info=True)
 
     def is_system_dark(self) -> bool:
         """Detect system dark mode"""
@@ -1332,7 +1504,7 @@ class ClipKeepApp(QMainWindow):
 
         self.btn_settings = QPushButton("⚙️")
         self.btn_settings.setToolTip(tr("settings", self.current_lang))
-        self.btn_settings.setFixedSize(36, 32)
+        self.btn_settings.setFixedSize(42, 32)  # 加宽按钮
         self.btn_settings.clicked.connect(self.open_settings_dialog)
         top_bar.addWidget(self.btn_settings)
 
@@ -1354,12 +1526,15 @@ class ClipKeepApp(QMainWindow):
         splitter.setHandleWidth(8)
 
         # History List
-        self.history_list = QListWidget()
+        self.history_list = DraggableListWidget()  # 使用自定义列表控件
+        self.history_list.parent_app = self  # 设置父应用引用
         self.history_list.currentItemChanged.connect(self.on_item_selected)
         self.history_list.itemClicked.connect(self.on_item_clicked)
         self.history_list.itemDoubleClicked.connect(self.on_item_double_clicked)
         self.history_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.history_list.customContextMenuRequested.connect(self.show_context_menu)
+        self.history_list.setDragEnabled(True)
+        self.history_list.setDefaultDropAction(Qt.DropAction.CopyAction)
         splitter.addWidget(self.history_list)
 
         # Detail View
@@ -1447,6 +1622,8 @@ class ClipKeepApp(QMainWindow):
 
     def quit_application(self):
         """Exit application"""
+        # Save window geometry before quit
+        self.save_settings_to_file()
         self.force_quit = True
         QApplication.quit()
 
@@ -1514,6 +1691,9 @@ class ClipKeepApp(QMainWindow):
             item.setData(ROLE_FORMAT, rec.format)
             item.setData(ROLE_CONTENT_HASH, rec.content_hash)
             item.setIcon(icon)
+            
+            # 设置拖拽数据
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled)
 
             self.history_list.addItem(item)
 
@@ -1640,6 +1820,8 @@ class ClipKeepApp(QMainWindow):
             self.db.add_text_record(text, fmt)
             self.db.trim_to_limit(self.max_history)
             self.refresh_history_async()
+            # 新内容添加后，滚动到顶部
+            QTimer.singleShot(100, lambda: self.history_list.scrollToTop())
         except Exception as e:
             print(f"Add text error: {e}")
 
@@ -1661,6 +1843,8 @@ class ClipKeepApp(QMainWindow):
     def on_image_saved(self, content_hash: str):
         """Called when image is saved"""
         self.refresh_history_async()
+        # 新内容添加后，滚动到顶部
+        QTimer.singleShot(100, lambda: self.history_list.scrollToTop())
 
     def copy_selected_to_system(self):
         if not self.current_record:
@@ -1699,12 +1883,12 @@ class ClipKeepApp(QMainWindow):
                 self.clipboard.setImage(self.current_record.content)
                 self.statusBar().showMessage(tr("copied_image", self.current_lang), 2000)
         except Exception as e:
-            print(f"Copy error: {e}")
-            traceback.print_exc()
+            logging.error(f"Copy error: {e}", exc_info=True)
+            QMessageBox.critical(self, "Copy Error", f"Failed to copy: {str(e)}")
             self.statusBar().showMessage(f"Copy failed: {str(e)}", 3000)
 
     def open_file_path(self):
-        """Open file with default app"""
+        """Open file with default application"""
         try:
             if not self.current_record or self.current_record.format != "file":
                 return
@@ -1724,10 +1908,10 @@ class ClipKeepApp(QMainWindow):
                         tr("open_failed", self.current_lang),
                         f"{tr('file_not_found', self.current_lang)}: {path_str}"
                     )
-                break
+                break  # Only open first file
         except Exception as e:
-            print(f"Open file error: {e}")
-            QMessageBox.warning(self, tr("open_failed", self.current_lang), str(e))
+            logging.error(f"Open file error: {e}", exc_info=True)
+            QMessageBox.critical(self, tr("open_failed", self.current_lang), str(e))
 
     def open_temp_image(self):
         """Open image in default viewer"""
@@ -1750,8 +1934,8 @@ class ClipKeepApp(QMainWindow):
                 QMessageBox.warning(self, tr("open_failed", self.current_lang), "Failed to save temp image")
                 
         except Exception as e:
-            print(f"Open image error: {e}")
-            QMessageBox.warning(self, tr("open_failed", self.current_lang), str(e))
+            logging.error(f"Open image error: {e}", exc_info=True)
+            QMessageBox.critical(self, tr("open_failed", self.current_lang), str(e))
 
     def delete_selected(self):
         item = self.history_list.currentItem()
@@ -1797,10 +1981,12 @@ class ClipKeepApp(QMainWindow):
         self.count_label.setText(f"{tr('items', self.current_lang)}: {count} / {self.max_history}")
 
     def filter_history(self, text):
+        """Filter history list using case-insensitive search"""
         search_text = text.lower()
         for i in range(self.history_list.count()):
             item = self.history_list.item(i)
             item_text = item.text().lower()
+            # 搜索项目文本
             match = search_text in item_text
             item.setHidden(not match)
 
@@ -1860,28 +2046,81 @@ class ClipKeepApp(QMainWindow):
                 print(f"Save error: {e}")
 
 if __name__ == "__main__":
-    # Single instance check
-    server = ClipKeepApp.create_single_instance_server()
-    if server is None:
-        app = QApplication(sys.argv)
-        QMessageBox.warning(
-            None,
-            tr("already_running", "zh_CN"),
-            tr("already_running_msg", "zh_CN")
-        )
-        sys.exit(0)
-
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setQuitOnLastWindowClosed(False)
-
     try:
-        app_icon = QIcon(resource_path("clipkeep.ico"))
-    except:
-        app_icon = app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
-    app.setWindowIcon(app_icon)
+        logging.info("=" * 50)
+        logging.info("ClipKeep Starting...")
+        logging.info(f"Python version: {sys.version}")
+        logging.info(f"Working directory: {os.getcwd()}")
+        
+        # Single instance check
+        logging.info("Creating QApplication...")
+        app = QApplication(sys.argv)
+        
+        # 启用字体抗锯齿和渲染优化
+        app.setFont(app.font())  # 使用系统默认字体
+        
+        # 设置字体渲染策略（改善文字显示）
+        from PyQt6.QtGui import QFont
+        font = app.font()
+        font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        app.setFont(font)
+        
+        logging.info("Checking single instance...")
+        server = ClipKeepApp.create_single_instance_server()
+        if server is None:
+            logging.warning("Another instance is already running")
+            QMessageBox.warning(
+                None,
+                tr("already_running", "zh_CN"),
+                tr("already_running_msg", "zh_CN")
+            )
+            sys.exit(0)
 
-    window = ClipKeepApp()
-    window.show()
+        logging.info("Setting application style...")
+        app.setStyle("Fusion")
+        app.setQuitOnLastWindowClosed(False)
 
-    sys.exit(app.exec())
+        logging.info("Loading application icon...")
+        try:
+            app_icon = QIcon(resource_path("clipkeep.ico"))
+            if not app_icon.isNull():
+                logging.info("Icon loaded successfully")
+        except Exception as icon_error:
+            logging.warning(f"Failed to load custom icon: {icon_error}")
+            app_icon = app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        app.setWindowIcon(app_icon)
+
+        logging.info("Creating main window...")
+        window = ClipKeepApp()
+        
+        logging.info("Showing main window...")
+        window.show()
+        
+        logging.info("ClipKeep started successfully!")
+        logging.info("=" * 50)
+        
+        sys.exit(app.exec())
+        
+    except Exception as e:
+        error_msg = f"Critical startup error: {e}\n{traceback.format_exc()}"
+        logging.critical(error_msg)
+        
+        # 尝试显示错误对话框
+        try:
+            if 'app' in locals():
+                QMessageBox.critical(
+                    None, 
+                    "ClipKeep Startup Error", 
+                    f"Failed to start ClipKeep:\n\n{str(e)}\n\nCheck log file at:\n{config_dir / 'clipkeep.log'}"
+                )
+        except:
+            pass
+        
+        # 打印到控制台
+        print("\n" + "="*50)
+        print("CRITICAL ERROR:")
+        print(error_msg)
+        print("="*50 + "\n")
+        
+        sys.exit(1)
