@@ -46,6 +46,14 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
+# 尝试导入全局快捷键支持
+try:
+    from pynput import keyboard
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    PYNPUT_AVAILABLE = False
+    logging.warning("pynput not available, global hotkey disabled")
+
 def resource_path(relative_path):
     """PyInstaller safe resource loading"""
     if hasattr(sys, '_MEIPASS'):
@@ -56,7 +64,7 @@ def resource_path(relative_path):
 # Constants
 # -----------------------
 APP_NAME = "ClipKeep"
-APP_VERSION = "2.251208"
+APP_VERSION = "2.251217"
 SINGLE_INSTANCE_KEY = "ClipKeep_Single_Instance_Server"
 
 ROLE_TYPE = Qt.ItemDataRole.UserRole
@@ -75,10 +83,10 @@ THUMBNAIL_SIZE = 64
 EDGE_HIDE_THRESHOLD = 5
 EDGE_SHOW_WIDTH = 3
 EDGE_DETECT_AREA = 30  # 增加检测区域
+EDGE_SNAP_DISTANCE = 25
 ANIMATION_DURATION = 250
 EDGE_HIDE_DELAY_MS = 1500  # 贴边后等待1.5秒再隐藏
 EDGE_SHOW_DELAY_MS = 300   # 光标靠近后等待0.3秒再显示
-EDGE_SNAP_DISTANCE = 30
 
 # Temp cleanup settings
 TEMP_CLEANUP_DAYS = 1
@@ -95,8 +103,8 @@ TRANSLATIONS = {
         "clear": "清空",
         "search_placeholder": "🔍 搜索剪切板... (Ctrl+F)",
         "content_preview": "内容预览...",
-        "zoom_hint": "💡 Ctrl+鼠标滚轮 缩放 | Ctrl+0 重置",
-        "ready": "Ready",
+        "zoom_hint": "💡 Ctrl+Scroll 缩放 | Ctrl+0 重置",
+        "ready": "Ready - Alt+V 快速调出",
         "settings_title": "设置",
         "always_on_top": "窗口置顶 (Always on Top)",
         "theme": "主题 (Theme):",
@@ -116,9 +124,9 @@ TRANSLATIONS = {
         "save": "保存",
         "cancel": "取消",
         "settings_saved": "设置已保存",
-        "show_window": "显示主窗口",
+        "show_window": "显示主窗口 (Alt+V)",
         "exit_app": "退出 ClipKeep",
-        "minimized_to_tray": "应用已最小化到托盘",
+        "minimized_to_tray": "已最小化到托盘 (Alt+V 快速调出)",
         "confirm_clear": "确认清空",
         "confirm_clear_msg": "确定要删除所有记录吗?此操作不可恢复。",
         "history_cleared": "历史已清空",
@@ -151,7 +159,7 @@ TRANSLATIONS = {
         "search_placeholder": "🔍 Search clipboard... (Ctrl+F)",
         "content_preview": "Content preview...",
         "zoom_hint": "💡 Ctrl+Scroll to Zoom | Ctrl+0 Reset",
-        "ready": "Ready",
+        "ready": "Ready - Alt+V to Show",
         "settings_title": "Settings",
         "always_on_top": "Always on Top",
         "theme": "Theme:",
@@ -171,9 +179,9 @@ TRANSLATIONS = {
         "save": "Save",
         "cancel": "Cancel",
         "settings_saved": "Settings Saved",
-        "show_window": "Show Main Window",
+        "show_window": "Show Main Window (Alt+V)",
         "exit_app": "Exit ClipKeep",
-        "minimized_to_tray": "Minimized to system tray",
+        "minimized_to_tray": "Minimized to tray (Alt+V to show)",
         "confirm_clear": "Confirm Clear",
         "confirm_clear_msg": "Are you sure you want to delete all records? This cannot be undone.",
         "history_cleared": "History Cleared",
@@ -1121,6 +1129,9 @@ class ClipKeepApp(QMainWindow):
         # Start monitoring
         self.clipboard = QApplication.clipboard()
         self.clipboard.dataChanged.connect(self.on_clipboard_change)
+        
+        # 设置全局快捷键 Alt+V
+        self.setup_global_hotkey()
 
     # -----------------------
     # Self-Check
@@ -1155,8 +1166,57 @@ class ClipKeepApp(QMainWindow):
             self.refresh_history_async()
 
     # -----------------------
-    # Single Instance
+    # Global Hotkey
     # -----------------------
+    def setup_global_hotkey(self):
+        """设置全局快捷键 Alt+V"""
+        if not PYNPUT_AVAILABLE:
+            logging.warning("Global hotkey not available (pynput not installed)")
+            return
+        
+        try:
+            def on_activate():
+                """快捷键被触发时调用"""
+                # 使用 Qt 信号来安全地切换窗口
+                QTimer.singleShot(0, self.toggle_window_from_hotkey)
+            
+            # 定义快捷键组合
+            hotkey = keyboard.HotKey(
+                keyboard.HotKey.parse('<alt>+v'),
+                on_activate
+            )
+            
+            def for_canonical(f):
+                return lambda k: f(keyboard_listener.canonical(k))
+            
+            keyboard_listener = keyboard.Listener(
+                on_press=for_canonical(hotkey.press),
+                on_release=for_canonical(hotkey.release)
+            )
+            
+            keyboard_listener.start()
+            self.keyboard_listener = keyboard_listener
+            logging.info("Global hotkey Alt+V registered successfully")
+            
+        except Exception as e:
+            logging.error(f"Failed to setup global hotkey: {e}", exc_info=True)
+    
+    def toggle_window_from_hotkey(self):
+        """通过快捷键切换窗口显示状态"""
+        try:
+            if self.is_hidden:
+                # 如果窗口贴边隐藏，显示出来
+                self.show_from_edge_animated()
+            elif not self.isVisible() or self.isMinimized():
+                # 如果窗口隐藏或最小化，显示并激活
+                self.showNormal()
+                self.activateWindow()
+                self.raise_()
+            else:
+                # 如果窗口已显示，最小化到托盘
+                self.hide()
+        except Exception as e:
+            logging.error(f"Toggle window error: {e}", exc_info=True)
     @staticmethod
     def create_single_instance_server() -> Optional[QLocalServer]:
         """Create server for single instance"""
@@ -1599,12 +1659,20 @@ class ClipKeepApp(QMainWindow):
         self.tray_icon.show()
 
     def on_tray_activated(self, reason):
+        """托盘图标被激活时的处理"""
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            if self.isVisible():
+            # 单击托盘图标
+            if self.is_hidden:
+                # 如果贴边隐藏，显示出来
+                self.show_from_edge_animated()
+            elif self.isVisible():
+                # 如果可见，隐藏到托盘
                 self.hide()
             else:
+                # 如果隐藏，显示并激活
                 self.showNormal()
                 self.activateWindow()
+                self.raise_()
 
     def closeEvent(self, event):
         """Minimize to tray"""
@@ -1624,6 +1692,15 @@ class ClipKeepApp(QMainWindow):
         """Exit application"""
         # Save window geometry before quit
         self.save_settings_to_file()
+        
+        # 停止全局快捷键监听
+        if PYNPUT_AVAILABLE and hasattr(self, 'keyboard_listener'):
+            try:
+                self.keyboard_listener.stop()
+                logging.info("Global hotkey listener stopped")
+            except:
+                pass
+        
         self.force_quit = True
         QApplication.quit()
 
